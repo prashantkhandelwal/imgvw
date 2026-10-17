@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use image::{DynamicImage, GenericImageView};
 
 pub const THUMBNAIL_SIZE: u32 = 160;
 const PREVIEW_SIZE: u32 = 4096;
+const SCAN_PROGRESS_BATCH_SIZE: usize = 64;
+const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -39,7 +42,17 @@ pub struct Decoded {
     pub metadata: Option<Metadata>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub files_read: usize,
+    pub images_found: usize,
+}
+
 pub enum Event {
+    ScanProgress {
+        generation: u64,
+        progress: ScanProgress,
+    },
     Folder {
         generation: u64,
         path: PathBuf,
@@ -122,7 +135,30 @@ impl Loader {
             .clear();
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let result = scan_folder(&path);
+            let mut latest = ScanProgress::default();
+            let mut reported = ScanProgress::default();
+            let mut last_update = Instant::now();
+            let result = scan_folder(&path, |progress| {
+                latest = progress;
+                if progress.files_read == 1
+                    || progress.files_read - reported.files_read >= SCAN_PROGRESS_BATCH_SIZE
+                    || last_update.elapsed() >= SCAN_PROGRESS_INTERVAL
+                {
+                    let _ = sender.send(Event::ScanProgress {
+                        generation,
+                        progress,
+                    });
+                    context.request_repaint();
+                    reported = progress;
+                    last_update = Instant::now();
+                }
+            });
+            if latest != reported {
+                let _ = sender.send(Event::ScanProgress {
+                    generation,
+                    progress: latest,
+                });
+            }
             let _ = sender.send(Event::Folder {
                 generation,
                 path,
@@ -180,9 +216,13 @@ pub fn supported(path: &Path) -> bool {
         })
 }
 
-pub fn scan_folder(path: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn scan_folder(
+    path: &Path,
+    mut on_progress: impl FnMut(ScanProgress),
+) -> Result<Vec<PathBuf>, String> {
     let mut directories = vec![path.to_owned()];
     let mut paths = Vec::new();
+    let mut progress = ScanProgress::default();
     while let Some(directory) = directories.pop() {
         let entries = fs::read_dir(&directory)
             .map_err(|error| format!("Cannot read folder {}: {error}", directory.display()))?;
@@ -202,8 +242,13 @@ pub fn scan_folder(path: &Path) -> Result<Vec<PathBuf>, String> {
             }
             if file_type.is_dir() {
                 directories.push(entry_path);
-            } else if file_type.is_file() && supported(&entry_path) {
-                paths.push(entry_path);
+            } else if file_type.is_file() {
+                progress.files_read += 1;
+                if supported(&entry_path) {
+                    paths.push(entry_path);
+                    progress.images_found += 1;
+                }
+                on_progress(progress);
             }
         }
     }
@@ -323,13 +368,13 @@ mod tests {
             fs::write(folder.path().join(name), []).unwrap();
         }
         fs::create_dir(folder.path().join("nested.jpg")).unwrap();
-        let names: Vec<_> = scan_folder(folder.path())
+        let names: Vec<_> = scan_folder(folder.path(), |_| {})
             .unwrap()
             .into_iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["A.jpg", "z.PNG"]);
-        assert!(scan_folder(&folder.path().join("missing")).is_err());
+        assert!(scan_folder(&folder.path().join("missing"), |_| {}).is_err());
     }
 
     #[test]
@@ -351,9 +396,9 @@ mod tests {
         }
         fs::write(deep.join("notes.txt"), []).unwrap();
         fs::write(deep.join("no-extension"), []).unwrap();
-        assert_eq!(scan_folder(folder.path()).unwrap(), expected);
+        assert_eq!(scan_folder(folder.path(), |_| {}).unwrap(), expected);
         assert!(
-            scan_folder(&deep.join("notes.txt"))
+            scan_folder(&deep.join("notes.txt"), |_| {})
                 .unwrap_err()
                 .contains(&deep.join("notes.txt").display().to_string())
         );
@@ -371,7 +416,43 @@ mod tests {
         fs::write(&image, []).unwrap();
         symlink(folder.path(), nested.join("parent")).unwrap();
         symlink(&image, folder.path().join("linked.png")).unwrap();
-        assert_eq!(scan_folder(folder.path()).unwrap(), vec![image]);
+        assert_eq!(scan_folder(folder.path(), |_| {}).unwrap(), vec![image]);
+    }
+
+    #[test]
+    fn recursive_scan_reports_files_checked_and_images_found() {
+        let folder = tempfile::tempdir().unwrap();
+        let nested = folder.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        for path in [
+            folder.path().join("root.png"),
+            folder.path().join("notes.txt"),
+            nested.join("child.JPG"),
+            nested.join("no-extension"),
+        ] {
+            fs::write(path, []).unwrap();
+        }
+        let mut updates = Vec::new();
+        let images = scan_folder(folder.path(), |progress| updates.push(progress)).unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(updates.len(), 4);
+        for (index, progress) in updates.iter().enumerate() {
+            assert_eq!(progress.files_read, index + 1);
+            assert!(progress.images_found <= progress.files_read);
+        }
+        assert_eq!(
+            updates.last(),
+            Some(&ScanProgress {
+                files_read: 4,
+                images_found: 2
+            })
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            scan_folder(empty.path(), |_| panic!("No files should be reported"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -462,13 +543,31 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("test.png");
         image::RgbaImage::new(8, 4).save(&path).unwrap();
+        fs::write(folder.path().join("notes.txt"), b"not an image").unwrap();
         let context = eframe::egui::Context::default();
         let loader = Loader::new(context.clone());
         let generation = loader.open_folder(folder.path().to_owned(), context);
-        let event = loader
-            .events
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        let mut progress_updates = Vec::new();
+        let event = loop {
+            let event = loader.events.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Event::ScanProgress {
+                generation: event_generation,
+                progress,
+            } = event
+            {
+                assert_eq!(event_generation, generation);
+                progress_updates.push(progress);
+            } else {
+                break event;
+            }
+        };
+        assert_eq!(
+            progress_updates.last(),
+            Some(&ScanProgress {
+                files_read: 2,
+                images_found: 1
+            })
+        );
         assert!(
             matches!(event, Event::Folder { result: Ok(paths), .. } if paths == vec![path.clone()])
         );

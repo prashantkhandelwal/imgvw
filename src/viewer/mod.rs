@@ -10,7 +10,7 @@ use std::sync::mpsc;
 
 use eframe::egui::{self, TextureHandle};
 
-use crate::loader::{Decoded, Event, Kind, Loader, Metadata, Request};
+use crate::loader::{Decoded, Event, Kind, Loader, Metadata, Request, ScanProgress};
 use crate::settings::{DefaultView, Settings};
 
 const MAX_THUMBNAILS: usize = 256;
@@ -29,6 +29,7 @@ pub(crate) struct Viewer {
     paths: Vec<PathBuf>,
     selected: Option<usize>,
     scanning: bool,
+    scan_progress: ScanProgress,
     picker: Option<mpsc::Receiver<Option<PathBuf>>>,
     thumbnails: HashMap<usize, Thumbnail>,
     pending: HashSet<usize>,
@@ -61,6 +62,7 @@ impl Viewer {
             paths: Vec::new(),
             selected: None,
             scanning: false,
+            scan_progress: ScanProgress::default(),
             picker: None,
             thumbnails: HashMap::new(),
             pending: HashSet::new(),
@@ -132,6 +134,7 @@ impl Viewer {
         self.metadata = None;
         self.folder_error = None;
         self.scanning = true;
+        self.scan_progress = ScanProgress::default();
         self.grid_view = self.settings.default_view == DefaultView::Grid;
     }
 
@@ -190,6 +193,12 @@ impl Viewer {
                 break;
             };
             match event {
+                Event::ScanProgress {
+                    generation,
+                    progress,
+                } if generation == self.generation && self.scanning => {
+                    self.scan_progress = progress;
+                }
                 Event::Folder {
                     generation,
                     path,

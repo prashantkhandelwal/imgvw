@@ -108,7 +108,10 @@ impl Viewer {
             ui.horizontal(|ui| {
                 if self.scanning {
                     ui.spinner();
-                    ui.label("Reading folder...");
+                    ui.label(format!(
+                        "Reading recursively: {} files checked, {} images found",
+                        self.scan_progress.files_read, self.scan_progress.images_found
+                    ));
                 } else if let Some(folder) = &self.folder {
                     let name = folder
                         .file_name()

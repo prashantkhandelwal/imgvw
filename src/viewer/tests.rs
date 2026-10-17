@@ -762,6 +762,71 @@ fn exif_details_are_hidden_until_clicked_and_can_be_collapsed() {
 }
 
 #[test]
+fn recursive_scan_progress_is_displayed_and_ignores_stale_updates() {
+    let context = egui::Context::default();
+    let mut viewer = Viewer::new(context.clone());
+    let (sender, receiver) = mpsc::channel();
+    viewer.loader.events = receiver;
+    viewer.generation = 2;
+    viewer.scanning = true;
+    sender
+        .send(Event::ScanProgress {
+            generation: 1,
+            progress: ScanProgress {
+                files_read: 999,
+                images_found: 999,
+            },
+        })
+        .unwrap();
+    sender
+        .send(Event::ScanProgress {
+            generation: 2,
+            progress: ScanProgress {
+                files_read: 42,
+                images_found: 12,
+            },
+        })
+        .unwrap();
+    for grid_view in [true, false] {
+        viewer.grid_view = grid_view;
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(
+            &output,
+            "Reading recursively: 42 files checked, 12 images found",
+        );
+        assert_eq!(
+            viewer.scan_progress,
+            ScanProgress {
+                files_read: 42,
+                images_found: 12
+            }
+        );
+    }
+    sender
+        .send(Event::Folder {
+            generation: 2,
+            path: PathBuf::from("finished"),
+            result: Ok(Vec::new()),
+        })
+        .unwrap();
+    sender
+        .send(Event::ScanProgress {
+            generation: 2,
+            progress: ScanProgress {
+                files_read: 100,
+                images_found: 100,
+            },
+        })
+        .unwrap();
+    render(&mut viewer, &context, Vec::new());
+    assert!(!viewer.scanning);
+    assert_eq!(viewer.scan_progress.files_read, 42);
+    let folder = tempfile::tempdir().unwrap();
+    viewer.open_folder(folder.path().to_owned(), &context);
+    assert_eq!(viewer.scan_progress, ScanProgress::default());
+}
+
+#[test]
 fn opening_a_folder_loads_nested_images_and_counts_them_in_both_views() {
     let folder = tempfile::tempdir().unwrap();
     let nested = folder.path().join("nested");
@@ -784,6 +849,13 @@ fn opening_a_folder_loads_nested_images_and_counts_them_in_both_views() {
         viewer.preview.is_some() && viewer.thumbnails.len() == 3
     });
     assert_eq!(viewer.paths, paths);
+    assert_eq!(
+        viewer.scan_progress,
+        ScanProgress {
+            files_read: 3,
+            images_found: 3
+        }
+    );
     assert_eq!(viewer.folder.as_deref(), Some(folder.path()));
     for grid_view in [true, false] {
         viewer.grid_view = grid_view;

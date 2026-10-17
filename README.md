@@ -9,6 +9,8 @@ Symbolic links are not followed. Images are sorted by filename (case-insensitive
 with the full path breaking ties; matching filenames in different folders are
 kept as separate images. Folder counts include all discovered images. An
 unreadable subfolder reports an error rather than silently showing a partial list.
+While scanning, the folder heading shows a live count of files checked and images
+found across all subfolders. The file count includes non-image files.
 The top bar contains the File menu with larger menu text.
 The folder heading shows the folder name and total image count in either view.
 Menus, panels, Preferences, the photo grid, and the preview canvas share the

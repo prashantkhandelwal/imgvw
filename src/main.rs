@@ -1,4 +1,5 @@
 mod loader;
+mod settings;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -6,10 +7,10 @@ use std::sync::mpsc;
 
 use eframe::egui::{self, Color32, RichText, TextureHandle, Vec2};
 use loader::{Event, Kind, Loader, Metadata, Request};
+use settings::{DefaultView, Settings};
 
 const ACCENT: Color32 = Color32::from_rgb(239, 171, 86);
-const BACKGROUND: Color32 = Color32::BLACK;
-const CHROME: Color32 = Color32::from_rgb(43, 43, 43);
+const BACKGROUND: Color32 = Color32::from_rgb(43, 43, 43);
 const MENU_FONT_SIZE: f32 = 16.0;
 const MAX_THUMBNAILS: usize = 256;
 const MAX_PENDING: usize = 48;
@@ -37,6 +38,12 @@ struct Viewer {
     frame: u64,
     reveal_selected: bool,
     preferences_open: bool,
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    preferences_draft: Settings,
+    preferences_picker: Option<mpsc::Receiver<Option<PathBuf>>>,
+    preferences_error: Option<String>,
+    preferences_saved: bool,
     grid_view: bool,
     thumbnail_size: f32,
 }
@@ -47,6 +54,13 @@ impl Viewer {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BACKGROUND;
         visuals.window_fill = BACKGROUND;
+        visuals.extreme_bg_color = BACKGROUND;
+        visuals.faint_bg_color = BACKGROUND;
+        visuals.code_bg_color = BACKGROUND;
+        visuals.widgets.noninteractive.bg_fill = BACKGROUND;
+        visuals.widgets.noninteractive.weak_bg_fill = BACKGROUND;
+        visuals.widgets.inactive.bg_fill = BACKGROUND;
+        visuals.widgets.inactive.weak_bg_fill = BACKGROUND;
         visuals.selection.bg_fill = ACCENT.gamma_multiply(0.3);
         visuals.selection.stroke.color = ACCENT;
         context.set_visuals(visuals);
@@ -68,25 +82,103 @@ impl Viewer {
             frame: 0,
             reveal_selected: false,
             preferences_open: false,
+            settings: Settings::default(),
+            settings_path: None,
+            preferences_draft: Settings::default(),
+            preferences_picker: None,
+            preferences_error: None,
+            preferences_saved: false,
             grid_view: true,
             thumbnail_size: 144.0,
         }
     }
 
     fn pick_folder(&mut self, context: &egui::Context) {
-        if self.picker.is_some() {
+        if self.picker_open() {
             return;
         }
+        self.picker = Some(Self::folder_dialog(
+            context,
+            "Open image folder",
+            &self.settings.default_folder,
+        ));
+    }
+
+    fn picker_open(&self) -> bool {
+        self.picker.is_some() || self.preferences_picker.is_some()
+    }
+
+    fn folder_dialog(
+        context: &egui::Context,
+        title: &'static str,
+        initial: &str,
+    ) -> mpsc::Receiver<Option<PathBuf>> {
         let (sender, receiver) = mpsc::channel();
-        self.picker = Some(receiver);
         let context = context.clone();
+        let initial = PathBuf::from(initial);
         std::thread::spawn(move || {
-            let folder = rfd::FileDialog::new()
-                .set_title("Open image folder")
-                .pick_folder();
+            let mut dialog = rfd::FileDialog::new().set_title(title);
+            if initial.is_dir() {
+                dialog = dialog.set_directory(initial);
+            }
+            let folder = dialog.pick_folder();
             let _ = sender.send(folder);
             context.request_repaint();
         });
+        receiver
+    }
+
+    fn restore_settings(&mut self, context: &egui::Context) {
+        match settings::path() {
+            Ok(path) => {
+                self.load_settings(&path, context);
+            }
+            Err(error) => {
+                self.preferences_error = Some(error);
+                self.preferences_open = true;
+            }
+        }
+    }
+
+    fn load_settings(&mut self, path: &std::path::Path, context: &egui::Context) {
+        self.settings_path = Some(path.to_owned());
+        match settings::load(path) {
+            Ok(settings) => {
+                self.settings = settings;
+                self.preferences_draft = self.settings.clone();
+                self.grid_view = self.settings.default_view == DefaultView::Grid;
+                if !self.settings.default_folder.is_empty() {
+                    self.open_folder(PathBuf::from(&self.settings.default_folder), context);
+                }
+            }
+            Err(error) => {
+                self.preferences_error = Some(error);
+                self.preferences_open = true;
+            }
+        }
+    }
+
+    fn save_preferences(&mut self) -> bool {
+        let result = self
+            .settings_path
+            .as_ref()
+            .ok_or_else(|| "The user's settings directory is unavailable.".to_string())
+            .and_then(|path| settings::save(path, &self.preferences_draft));
+        match result {
+            Ok(()) => {
+                self.settings = self.preferences_draft.clone();
+                self.grid_view = self.settings.default_view == DefaultView::Grid;
+                self.reveal_selected = true;
+                self.preferences_error = None;
+                self.preferences_saved = true;
+                true
+            }
+            Err(error) => {
+                self.preferences_error = Some(error);
+                self.preferences_saved = false;
+                false
+            }
+        }
     }
 
     fn open_folder(&mut self, path: PathBuf, context: &egui::Context) {
@@ -102,7 +194,7 @@ impl Viewer {
         self.metadata = None;
         self.folder_error = None;
         self.scanning = true;
-        self.grid_view = true;
+        self.grid_view = self.settings.default_view == DefaultView::Grid;
     }
 
     fn select(&mut self, index: usize) {
@@ -129,6 +221,30 @@ impl Viewer {
     }
 
     fn receive(&mut self, context: &egui::Context) {
+        if let Some(receiver) = &self.preferences_picker {
+            match receiver.try_recv() {
+                Ok(folder) => {
+                    self.preferences_picker = None;
+                    if self.preferences_open
+                        && let Some(path) = folder
+                    {
+                        match path.into_os_string().into_string() {
+                            Ok(path) => self.preferences_draft.default_folder = path,
+                            Err(_) => {
+                                self.preferences_error = Some(
+                                    "The selected folder path cannot be displayed as text.".into(),
+                                )
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.preferences_picker = None;
+                    self.preferences_error = Some("The folder picker closed unexpectedly.".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(receiver) = &self.picker {
             match receiver.try_recv() {
                 Ok(folder) => {
@@ -227,7 +343,7 @@ impl Viewer {
 
     fn toolbar(&mut self, context: &egui::Context) {
         egui::TopBottomPanel::top("menu_bar")
-            .frame(egui::Frame::new().fill(CHROME).inner_margin(6.0))
+            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(6.0))
             .show(context, |ui| {
                 ui.style_mut().text_styles.insert(
                     egui::TextStyle::Button,
@@ -241,15 +357,21 @@ impl Viewer {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.spacing_mut().interact_size.y = 28.0;
                 egui::menu::bar(ui, |ui| {
+                    let menu_font = egui::TextStyle::Button.resolve(ui.style());
                     ui.menu_button("File", |ui| {
+                        ui.style_mut().override_font_id = Some(menu_font);
                         if ui
-                            .add_enabled(self.picker.is_none(), egui::Button::new("Open Folder(s)"))
+                            .add_enabled(!self.picker_open(), egui::Button::new("Open Folder(s)"))
                             .clicked()
                         {
                             self.pick_folder(context);
                             ui.close_menu();
                         }
                         if ui.button("Preferences").clicked() {
+                            if !self.preferences_open {
+                                self.preferences_draft = self.settings.clone();
+                                self.preferences_saved = false;
+                            }
                             self.preferences_open = true;
                             ui.close_menu();
                         }
@@ -261,14 +383,7 @@ impl Viewer {
                     });
                 });
             });
-        egui::Window::new("Preferences")
-            .open(&mut self.preferences_open)
-            .collapsible(false)
-            .resizable(false)
-            .show(context, |ui| {
-                ui.label("Default location");
-                ui.weak("The default folder location is not configurable yet.");
-            });
+        self.preferences(context);
         egui::TopBottomPanel::top("toolbar").show(context, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -280,7 +395,7 @@ impl Viewer {
             ui.add_space(6.0);
         });
         egui::TopBottomPanel::bottom("status_bar")
-            .frame(egui::Frame::new().fill(CHROME).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(8.0))
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.grid_view, "Photos").clicked() {
@@ -334,6 +449,76 @@ impl Viewer {
         });
     }
 
+    fn preferences(&mut self, context: &egui::Context) {
+        let mut open = self.preferences_open;
+        let mut save = false;
+        let mut close_after_save = false;
+        egui::Window::new("Preferences")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(context, |ui| {
+                ui.label("Default folder location");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.preferences_draft.default_folder)
+                            .hint_text("Choose a folder (optional)")
+                            .desired_width(330.0),
+                    );
+                    if ui
+                        .add_enabled(!self.picker_open(), egui::Button::new("Browse..."))
+                        .clicked()
+                    {
+                        self.preferences_picker = Some(Self::folder_dialog(
+                            context,
+                            "Choose default folder",
+                            &self.preferences_draft.default_folder,
+                        ));
+                    }
+                });
+                ui.weak("Opened automatically when imgvw starts. Leave empty for no folder.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label("Default view");
+                    egui::ComboBox::from_id_salt("default_view")
+                        .selected_text(self.preferences_draft.default_view.label())
+                        .show_ui(ui, |ui| {
+                            for view in [DefaultView::Grid, DefaultView::Preview] {
+                                ui.selectable_value(
+                                    &mut self.preferences_draft.default_view,
+                                    view,
+                                    view.label(),
+                                );
+                            }
+                        });
+                });
+                if let Some(error) = &self.preferences_error {
+                    ui.add_space(10.0);
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                } else if self.preferences_saved && self.preferences_draft == self.settings {
+                    ui.add_space(10.0);
+                    ui.label("Settings saved.");
+                }
+                ui.add_space(16.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(!self.picker_open(), |ui| {
+                        if ui.button("Ok").clicked() {
+                            save = true;
+                            close_after_save = true;
+                        }
+                        if ui.button("Save").clicked() {
+                            save = true;
+                        }
+                    });
+                });
+            });
+        self.preferences_open = open;
+        if save && self.save_preferences() && close_after_save {
+            self.preferences_open = false;
+        }
+    }
+
     fn grid(&mut self, ui: &mut egui::Ui) {
         let gap = 4.0;
         let columns = ((ui.available_width() + gap) / (self.thumbnail_size + gap))
@@ -378,7 +563,7 @@ impl Viewer {
     fn thumbnail(&mut self, ui: &mut egui::Ui, index: usize, rect: egui::Rect, name: bool) {
         let response = ui.allocate_rect(rect, egui::Sense::click());
         let active = self.selected == Some(index);
-        ui.painter().rect_filled(rect, 0.0, CHROME);
+        ui.painter().rect_filled(rect, 0.0, BACKGROUND);
         let image_rect = if name {
             egui::Rect::from_min_size(rect.min + Vec2::splat(5.0), Vec2::new(106.0, 69.0))
         } else {
@@ -502,6 +687,7 @@ impl Viewer {
             .resizable(true)
             .default_width(260.0)
             .width_range(210.0..=420.0)
+            .frame(egui::Frame::side_top_panel(&context.style()).fill(BACKGROUND))
             .show(context, |ui| {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(12.0);
@@ -589,7 +775,7 @@ impl Viewer {
     fn show(&mut self, context: &egui::Context) {
         self.frame += 1;
         self.receive(context);
-        if self.picker.is_none() && !context.wants_keyboard_input() {
+        if !self.picker_open() && !self.preferences_open && !context.wants_keyboard_input() {
             if context.input(|input| input.key_pressed(egui::Key::Escape)) {
                 self.grid_view = true;
                 self.reveal_selected = true;
@@ -689,7 +875,11 @@ fn main() -> eframe::Result {
                 .with_min_inner_size([760.0, 480.0]),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(Viewer::new(cc.egui_ctx.clone())))),
+        Box::new(|cc| {
+            let mut viewer = Viewer::new(cc.egui_ctx.clone());
+            viewer.restore_settings(&cc.egui_ctx);
+            Ok(Box::new(viewer))
+        }),
     )
 }
 
@@ -790,20 +980,187 @@ mod tests {
     }
 
     #[test]
+    fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let photos = directory.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        image::RgbaImage::new(40, 20)
+            .save(photos.join("photo.png"))
+            .unwrap();
+        let path = directory.path().join("config").join("settings.json");
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        viewer.settings_path = Some(path.clone());
+        viewer.preferences_open = true;
+        viewer.preferences_draft = Settings {
+            default_folder: photos.to_str().unwrap().into(),
+            default_view: DefaultView::Preview,
+        };
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        let save = text_position(&output, "Save");
+        let ok = text_position(&output, "Ok");
+        let folder_label = text_position(&output, "Default folder location");
+        let view_label = text_position(&output, "Default view");
+        assert!(save.x < ok.x && save.x > folder_label.x);
+        assert!(save.y > view_label.y);
+        click(&mut viewer, &context, save);
+        assert!(viewer.preferences_open, "Save must leave Preferences open");
+        assert_eq!(settings::load(&path).unwrap(), viewer.preferences_draft);
+        assert!(!viewer.grid_view);
+        assert!(viewer.preferences_error.is_none());
+
+        let mut restarted = Viewer::new(context.clone());
+        restarted.load_settings(&path, &context);
+        assert_eq!(restarted.folder.as_deref(), Some(photos.as_path()));
+        assert!(!restarted.grid_view);
+        wait_until(&mut restarted, &context, |viewer| viewer.preview.is_some());
+
+        viewer.preferences_draft.default_view = DefaultView::Grid;
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        click(&mut viewer, &context, text_position(&output, "Ok"));
+        assert!(
+            !viewer.preferences_open,
+            "Ok must save and close Preferences"
+        );
+        assert_eq!(
+            settings::load(&path).unwrap().default_view,
+            DefaultView::Grid
+        );
+        assert!(viewer.grid_view);
+        restarted.load_settings(&path, &context);
+        assert!(restarted.grid_view);
+    }
+
+    #[test]
+    fn preferences_reports_errors_without_closing_or_losing_saved_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        settings::save(&path, &Settings::default()).unwrap();
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        viewer.load_settings(&path, &context);
+        viewer.preferences_open = true;
+        viewer.preferences_draft.default_folder =
+            directory.path().join("missing").display().to_string();
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        click(&mut viewer, &context, text_position(&output, "Ok"));
+        assert!(viewer.preferences_open);
+        assert!(
+            viewer
+                .preferences_error
+                .as_ref()
+                .unwrap()
+                .contains("existing folder")
+        );
+        assert_eq!(settings::load(&path).unwrap(), Settings::default());
+        assert_eq!(viewer.settings, Settings::default());
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, viewer.preferences_error.as_ref().unwrap());
+
+        viewer.preferences_draft = Settings::default();
+        viewer.settings_path = Some(directory.path().to_owned());
+        assert!(!viewer.save_preferences());
+        assert!(
+            viewer
+                .preferences_error
+                .as_ref()
+                .unwrap()
+                .contains("Cannot save settings")
+        );
+        std::fs::write(&path, b"broken settings").unwrap();
+        let mut restarted = Viewer::new(context.clone());
+        restarted.load_settings(&path, &context);
+        assert!(restarted.preferences_open);
+        assert!(
+            restarted
+                .preferences_error
+                .as_ref()
+                .unwrap()
+                .contains("Invalid settings")
+        );
+    }
+
+    #[test]
+    fn preferences_folder_picker_updates_only_the_draft_and_handles_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        viewer.preferences_open = true;
+        let (sender, receiver) = mpsc::channel();
+        viewer.preferences_picker = Some(receiver);
+        sender.send(Some(directory.path().to_owned())).unwrap();
+        viewer.receive(&context);
+        assert_eq!(
+            viewer.preferences_draft.default_folder,
+            directory.path().to_str().unwrap()
+        );
+        assert!(viewer.settings.default_folder.is_empty());
+        assert!(viewer.folder.is_none());
+        assert!(viewer.preferences_picker.is_none());
+
+        let (sender, receiver) = mpsc::channel();
+        viewer.preferences_picker = Some(receiver);
+        sender.send(None).unwrap();
+        viewer.receive(&context);
+        assert_eq!(
+            viewer.preferences_draft.default_folder,
+            directory.path().to_str().unwrap()
+        );
+        assert!(viewer.preferences_error.is_none());
+
+        let (sender, receiver) = mpsc::channel();
+        viewer.preferences_picker = Some(receiver);
+        drop(sender);
+        viewer.receive(&context);
+        assert!(
+            viewer
+                .preferences_error
+                .as_ref()
+                .unwrap()
+                .contains("unexpectedly")
+        );
+    }
+
+    #[test]
     fn file_menu_opens_preferences_and_requests_exit() {
         let context = egui::Context::default();
         let mut viewer = Viewer::new(context.clone());
         render(&mut viewer, &context, Vec::new());
         let output = render(&mut viewer, &context, Vec::new());
         let file_position = text_position(&output, "File");
+        let menu_font = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "File" => {
+                    Some(text.galley.job.sections[0].format.font_id.clone())
+                }
+                _ => None,
+            })
+            .expect("File menu font should be available");
         click(&mut viewer, &context, file_position);
         let output = render(&mut viewer, &context, Vec::new());
+        for label in ["Open Folder(s)", "Preferences", "Exit"] {
+            assert!(
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text)
+                    if text.galley.job.text == label
+                    && text.galley.job.sections.iter().all(|section| {
+                        section.format.font_id == menu_font
+                    }))
+                }),
+                "{label} must use the menu bar font"
+            );
+        }
         text_position(&output, "Open Folder(s)");
         text_position(&output, "Exit");
         click(&mut viewer, &context, text_position(&output, "Preferences"));
         assert!(viewer.preferences_open);
         let output = render(&mut viewer, &context, Vec::new());
-        text_position(&output, "Default location");
+        text_position(&output, "Default folder location");
 
         click(&mut viewer, &context, file_position);
         let output = render(&mut viewer, &context, Vec::new());
@@ -832,8 +1189,67 @@ mod tests {
     }
 
     #[test]
-    fn grid_uses_dark_chrome_and_black_canvas() {
-        assert_eq!(BACKGROUND, Color32::from_rgb(0, 0, 0));
+    fn menus_preferences_and_inputs_use_the_shared_background() {
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        let style = context.style();
+        for color in [
+            egui::Frame::menu(&style).fill,
+            egui::Frame::window(&style).fill,
+            style.visuals.extreme_bg_color,
+            style.visuals.faint_bg_color,
+            style.visuals.code_bg_color,
+            style.visuals.widgets.noninteractive.bg_fill,
+            style.visuals.widgets.inactive.bg_fill,
+            style.visuals.widgets.inactive.weak_bg_fill,
+        ] {
+            assert_eq!(color, BACKGROUND);
+        }
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        click(&mut viewer, &context, text_position(&output, "File"));
+        let output = render(&mut viewer, &context, Vec::new());
+        let menu_item = text_position(&output, "Open Folder(s)");
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Rect(rect)
+                if rect.rect.contains(menu_item) && rect.fill == BACKGROUND)
+        }));
+        click(&mut viewer, &context, text_position(&output, "Preferences"));
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        let field_label = text_position(&output, "Default folder location");
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Rect(rect)
+                if rect.rect.contains(field_label) && rect.fill == BACKGROUND)
+        }));
+    }
+
+    #[test]
+    fn preview_details_pane_matches_menu_bar_color() {
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        viewer.grid_view = false;
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        for (point, color) in [
+            (egui::pos2(5.0, 5.0), BACKGROUND),
+            (egui::pos2(1270.0, 170.0), BACKGROUND),
+            (egui::pos2(1270.0, 600.0), BACKGROUND),
+            (egui::pos2(5.0, 170.0), BACKGROUND),
+        ] {
+            assert!(
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect)
+                        if rect.rect.contains(point) && rect.fill == color)
+                }),
+                "Unexpected preview panel color at {point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_uses_the_shared_background_everywhere() {
+        assert_eq!(BACKGROUND, Color32::from_rgb(43, 43, 43));
         let context = egui::Context::default();
         let mut viewer = Viewer::new(context.clone());
         render(&mut viewer, &context, Vec::new());
@@ -841,8 +1257,8 @@ mod tests {
         assert_eq!(context.style().visuals.panel_fill, BACKGROUND);
         assert_eq!(context.style().visuals.window_fill, BACKGROUND);
         for (point, color) in [
-            (egui::pos2(5.0, 5.0), CHROME),
-            (egui::pos2(5.0, 810.0), CHROME),
+            (egui::pos2(5.0, 5.0), BACKGROUND),
+            (egui::pos2(5.0, 810.0), BACKGROUND),
             (egui::pos2(1270.0, 170.0), BACKGROUND),
             (egui::pos2(5.0, 170.0), BACKGROUND),
         ] {
@@ -929,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn system_theme_cannot_override_the_black_panels() {
+    fn system_theme_cannot_override_the_shared_background() {
         let context = egui::Context::default();
         let mut viewer = Viewer::new(context.clone());
         for theme in [egui::Theme::Light, egui::Theme::Dark, egui::Theme::Light] {
@@ -944,11 +1360,11 @@ mod tests {
             let _ = context.run(input.clone(), |context| viewer.show(context));
             let output = context.run(input, |context| viewer.show(context));
             assert_eq!(context.theme(), egui::Theme::Dark);
-            assert_eq!(context.style().visuals.panel_fill, Color32::BLACK);
-            assert_eq!(context.style().visuals.window_fill, Color32::BLACK);
+            assert_eq!(context.style().visuals.panel_fill, BACKGROUND);
+            assert_eq!(context.style().visuals.window_fill, BACKGROUND);
             for (point, color) in [
-                (egui::pos2(5.0, 5.0), CHROME),
-                (egui::pos2(5.0, 810.0), CHROME),
+                (egui::pos2(5.0, 5.0), BACKGROUND),
+                (egui::pos2(5.0, 810.0), BACKGROUND),
                 (egui::pos2(1270.0, 170.0), BACKGROUND),
                 (egui::pos2(5.0, 170.0), BACKGROUND),
             ] {

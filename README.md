@@ -37,3 +37,22 @@ Settings are stored per user in `imgvw/settings.json` under the operating
 system's configuration directory (`%APPDATA%\imgvw\settings.json` on Windows,
 `$XDG_CONFIG_HOME/imgvw/settings.json` or `~/.config/imgvw/settings.json` on Linux,
 and `~/Library/Application Support/imgvw/settings.json` on macOS).
+
+## Source layout
+
+- [src/main.rs](src/main.rs): native window setup and app startup.
+- [src/viewer/mod.rs](src/viewer/mod.rs): viewer state, navigation, loading events,
+  texture cache, and frame orchestration.
+- [src/viewer/controls.rs](src/viewer/controls.rs): menu bar, folder heading, and
+  view/size controls.
+- [src/viewer/preferences.rs](src/viewer/preferences.rs): Preferences UI and
+  applying saved settings.
+- [src/viewer/thumbnails.rs](src/viewer/thumbnails.rs): grid, filmstrip, and
+  shared thumbnail rendering.
+- [src/viewer/preview.rs](src/viewer/preview.rs): preview rendering, zoom/panning,
+  empty states, and image/EXIF details.
+- [src/viewer/theme.rs](src/viewer/theme.rs): shared colors, menu font size, and
+  theme setup.
+- [src/viewer/tests.rs](src/viewer/tests.rs): headless UI and interaction tests.
+- [src/loader.rs](src/loader.rs): background folder scanning and image decoding.
+- [src/settings.rs](src/settings.rs): settings format and atomic persistence.

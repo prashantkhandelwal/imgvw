@@ -47,6 +47,7 @@ struct Viewer {
     preferences_saved: bool,
     grid_view: bool,
     thumbnail_size: f32,
+    preview_zoom: f32,
 }
 
 impl Viewer {
@@ -98,6 +99,7 @@ impl Viewer {
             preferences_saved: false,
             grid_view: true,
             thumbnail_size: 144.0,
+            preview_zoom: 100.0,
         }
     }
 
@@ -416,7 +418,14 @@ impl Viewer {
                     ui.separator();
                     ui.weak("Ctrl+O: open folder");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
+                        if !self.grid_view {
+                            ui.add(
+                                egui::Slider::new(&mut self.preview_zoom, 25.0..=400.0)
+                                    .suffix("%")
+                                    .text("Zoom"),
+                            )
+                            .on_hover_text("100% uses the fitted preview size. Scroll to explore enlarged images.");
+                        } else if ui
                             .add(
                                 egui::Slider::new(&mut self.thumbnail_size, 80.0..=240.0)
                                     .show_value(false)
@@ -825,9 +834,50 @@ impl Viewer {
                     let available = ui.available_size();
                     let size = texture.size_vec2();
                     let fitted = size * (available.x / size.x).min(available.y / size.y).min(1.0);
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new(texture).fit_to_exact_size(fitted));
-                    });
+                    let zoomed = fitted * (self.preview_zoom / 100.0);
+                    let can_pan = zoomed.x > available.x || zoomed.y > available.y;
+                    let scroll = egui::ScrollArea::both()
+                        .id_salt(("preview_zoom", self.generation, self.selected))
+                        .drag_to_scroll(false)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let (canvas, _) =
+                                ui.allocate_exact_size(available.max(zoomed), egui::Sense::hover());
+                            let image_rect = egui::Rect::from_center_size(canvas.center(), zoomed);
+                            ui.painter().image(
+                                texture.id(),
+                                image_rect,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            let response = ui.interact(
+                                image_rect.intersect(ui.clip_rect()),
+                                ui.id().with("preview_image"),
+                                if can_pan {
+                                    egui::Sense::drag()
+                                } else {
+                                    egui::Sense::hover()
+                                },
+                            );
+                            if can_pan {
+                                if response.dragged_by(egui::PointerButton::Primary) {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                } else {
+                                    response.clone().on_hover_cursor(egui::CursorIcon::Grab);
+                                }
+                            }
+                            response
+                        });
+                    if scroll.inner.dragged_by(egui::PointerButton::Primary) {
+                        let max_offset =
+                            (scroll.content_size - scroll.inner_rect.size()).max(Vec2::ZERO);
+                        let mut state = scroll.state;
+                        state.offset = (state.offset - scroll.inner.drag_delta())
+                            .max(Vec2::ZERO)
+                            .min(max_offset);
+                        state.store(ui.ctx(), scroll.id);
+                        ui.ctx().request_repaint();
+                    }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
@@ -1358,6 +1408,137 @@ mod tests {
                 "Missing matching panel background at {point:?}"
             );
         }
+    }
+
+    #[test]
+    fn preview_zoom_slider_resizes_and_pans_without_changing_thumbnails() {
+        fn preview_rect(
+            output: &egui::FullOutput,
+            texture: egui::TextureId,
+        ) -> (egui::Rect, egui::Rect) {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                        Some((mesh.calc_bounds(), shape.clip_rect))
+                    }
+                    _ => None,
+                })
+                .expect("Preview image should be rendered")
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(1600, 1200)
+            .save(folder.path().join("photo.png"))
+            .unwrap();
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let mut viewer = Viewer::new(context.clone());
+        viewer.open_folder(folder.path().to_owned(), &context);
+        wait_until(&mut viewer, &context, |viewer| viewer.preview.is_some());
+        viewer.grid_view = false;
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, "Zoom");
+        let texture = viewer.preview.as_ref().unwrap().id();
+        let initial = preview_rect(&output, texture).0;
+        let slider_position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) if circle.center.y > 780.0 => {
+                    Some(circle.center + Vec2::new(20.0, 0.0))
+                }
+                _ => None,
+            })
+            .expect("Zoom slider handle should be visible");
+        click(&mut viewer, &context, slider_position);
+        assert!(viewer.preview_zoom > 100.0);
+        assert_eq!(viewer.thumbnail_size, 144.0);
+        let output = render(&mut viewer, &context, Vec::new());
+        let enlarged = preview_rect(&output, texture).0;
+        assert!((enlarged.width() / initial.width() - viewer.preview_zoom / 100.0).abs() < 0.01);
+
+        for percent in [25.0, 100.0, 400.0] {
+            viewer.preview_zoom = percent;
+            render(&mut viewer, &context, Vec::new());
+            let output = render(&mut viewer, &context, Vec::new());
+            let (image, clip) = preview_rect(&output, texture);
+            assert!((image.width() / initial.width() - percent / 100.0).abs() < 0.01);
+            assert!((image.height() / initial.height() - percent / 100.0).abs() < 0.01);
+            if percent == 400.0 {
+                assert!(image.width() > clip.width() && image.height() > clip.height());
+                render(
+                    &mut viewer,
+                    &context,
+                    vec![
+                        egui::Event::PointerMoved(clip.center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, -120.0),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                let output = render(&mut viewer, &context, Vec::new());
+                let before_drag = preview_rect(&output, texture).0;
+                assert!(before_drag.min.y < image.min.y);
+                assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Grab);
+                let start = clip.center();
+                render(
+                    &mut viewer,
+                    &context,
+                    vec![egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let end = start - Vec2::new(80.0, 60.0);
+                let output = render(&mut viewer, &context, vec![egui::Event::PointerMoved(end)]);
+                assert_eq!(
+                    output.platform_output.cursor_icon,
+                    egui::CursorIcon::Grabbing
+                );
+                let output = render(&mut viewer, &context, Vec::new());
+                let after_drag = preview_rect(&output, texture).0;
+                assert!(
+                    after_drag.min.x < before_drag.min.x,
+                    "Dragging left must pan horizontally"
+                );
+                assert!(
+                    after_drag.min.y < before_drag.min.y,
+                    "Dragging up must pan vertically"
+                );
+                let output = render(
+                    &mut viewer,
+                    &context,
+                    vec![egui::Event::PointerButton {
+                        pos: end,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Grab);
+            } else {
+                let output = render(
+                    &mut viewer,
+                    &context,
+                    vec![egui::Event::PointerMoved(image.center())],
+                );
+                assert_ne!(output.platform_output.cursor_icon, egui::CursorIcon::Grab);
+            }
+        }
+        viewer.grid_view = true;
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, "Thumbnail size");
+        assert_eq!(viewer.thumbnail_size, 144.0);
+        viewer.grid_view = false;
+        render(&mut viewer, &context, Vec::new());
+        assert_eq!(viewer.preview_zoom, 400.0);
     }
 
     #[test]

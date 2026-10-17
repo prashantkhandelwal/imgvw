@@ -15,6 +15,12 @@ Photos open in a dark, full-window thumbnail grid. Adjust the thumbnail size
 with the slider at the bottom right. Click a photo to select it; double-click
 or press Enter to open its preview and EXIF details. Use **Photos** or Escape
 to return to the grid. Left/Right navigate between photos in either view.
+In Preview, the bottom-right slider controls **Zoom** (25% to 400%) instead
+of thumbnail size. 100% is the fitted preview size; scroll or grab and drag
+with the left mouse button to explore enlarged images. The cursor changes to
+an open hand over a pannable image and a closed hand while dragging.
+Zoom and thumbnail size are kept separately when
+switching views.
 
 ## Preferences
 

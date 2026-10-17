@@ -11,6 +11,7 @@ use settings::{DefaultView, Settings};
 
 const ACCENT: Color32 = Color32::from_rgb(239, 171, 86);
 const BACKGROUND: Color32 = Color32::from_rgb(43, 43, 43);
+const BUTTON_BACKGROUND: Color32 = Color32::from_rgb(75, 75, 75);
 const MENU_FONT_SIZE: f32 = 16.0;
 const MAX_THUMBNAILS: usize = 256;
 const MAX_PENDING: usize = 48;
@@ -59,8 +60,15 @@ impl Viewer {
         visuals.code_bg_color = BACKGROUND;
         visuals.widgets.noninteractive.bg_fill = BACKGROUND;
         visuals.widgets.noninteractive.weak_bg_fill = BACKGROUND;
-        visuals.widgets.inactive.bg_fill = BACKGROUND;
-        visuals.widgets.inactive.weak_bg_fill = BACKGROUND;
+        for (state, color) in [
+            (&mut visuals.widgets.inactive, BUTTON_BACKGROUND),
+            (&mut visuals.widgets.hovered, Color32::from_gray(90)),
+            (&mut visuals.widgets.active, Color32::from_gray(105)),
+            (&mut visuals.widgets.open, Color32::from_gray(90)),
+        ] {
+            state.bg_fill = color;
+            state.weak_bg_fill = color;
+        }
         visuals.selection.bg_fill = ACCENT.gamma_multiply(0.3);
         visuals.selection.stroke.color = ACCENT;
         context.set_visuals(visuals);
@@ -384,21 +392,14 @@ impl Viewer {
                 });
             });
         self.preferences(context);
-        egui::TopBottomPanel::top("toolbar").show(context, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("All Photos").strong().size(18.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!("{} photos", self.paths.len()));
-                });
-            });
-            ui.add_space(6.0);
-        });
         egui::TopBottomPanel::bottom("status_bar")
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(8.0))
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.grid_view, "Photos").clicked() {
+                    if ui
+                        .add(egui::Button::new("Photos").selected(self.grid_view))
+                        .clicked()
+                    {
                         self.grid_view = true;
                         self.reveal_selected = true;
                     }
@@ -439,8 +440,17 @@ impl Viewer {
                         .file_name()
                         .unwrap_or(folder.as_os_str())
                         .to_string_lossy();
-                    ui.add(egui::Label::new(RichText::new(name).strong()).truncate())
-                        .on_hover_text(folder.display().to_string());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let count = self.paths.len();
+                        ui.weak(format!(
+                            "{count} {}",
+                            if count == 1 { "image" } else { "images" }
+                        ));
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(name).strong()).truncate())
+                                .on_hover_text(folder.display().to_string());
+                        });
+                    });
                 } else {
                     ui.weak("Open a folder to browse your photos");
                 }
@@ -960,6 +970,29 @@ mod tests {
     }
 
     #[test]
+    fn folder_heading_shows_the_total_image_count_in_both_views() {
+        for grid_view in [true, false] {
+            for count in [0, 1, 24] {
+                let context = egui::Context::default();
+                let mut viewer = Viewer::new(context.clone());
+                viewer.grid_view = grid_view;
+                viewer.folder = Some(PathBuf::from("example-folder"));
+                viewer.paths = (0..count)
+                    .map(|index| PathBuf::from(format!("{index}.png")))
+                    .collect();
+                render(&mut viewer, &context, Vec::new());
+                let output = render(&mut viewer, &context, Vec::new());
+                let folder = text_position(&output, "example-folder");
+                let label = format!("{count} {}", if count == 1 { "image" } else { "images" });
+                let total = text_position(&output, &label);
+                assert!(total.x > folder.x);
+                assert!((total.y - folder.y).abs() < 2.0);
+                assert!(total.x < 1280.0);
+            }
+        }
+    }
+
+    #[test]
     fn menu_bar_has_larger_text_without_navigation_buttons() {
         let context = egui::Context::default();
         let mut viewer = Viewer::new(context.clone());
@@ -1189,6 +1222,63 @@ mod tests {
     }
 
     #[test]
+    fn buttons_contrast_with_panels_and_have_distinct_interaction_states() {
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let mut viewer = Viewer::new(context.clone());
+        let style = context.style();
+        assert_ne!(BUTTON_BACKGROUND, BACKGROUND);
+        assert_eq!(
+            style.visuals.widgets.inactive.weak_bg_fill,
+            BUTTON_BACKGROUND
+        );
+        assert_ne!(
+            style.visuals.widgets.hovered.weak_bg_fill,
+            BUTTON_BACKGROUND
+        );
+        assert_ne!(
+            style.visuals.widgets.active.weak_bg_fill,
+            style.visuals.widgets.hovered.weak_bg_fill,
+        );
+        viewer.grid_view = false;
+        viewer.preferences_open = true;
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        let file_position = text_position(&output, "File");
+        assert!(
+            !output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect)
+                if rect.rect.contains(file_position) && rect.fill == BUTTON_BACKGROUND)
+            }),
+            "The menu bar should not use the contrasting button fill"
+        );
+        for label in ["Photos", "Browse...", "Save", "Ok", "Choose a folder"] {
+            let position = text_position(&output, label);
+            assert!(
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.rect.contains(position) && rect.fill == BUTTON_BACKGROUND)
+                }),
+                "{label} should have a contrasting button fill"
+            );
+        }
+        viewer.preferences_open = false;
+        render(&mut viewer, &context, Vec::new());
+        click(&mut viewer, &context, text_position(&output, "File"));
+        let output = render(&mut viewer, &context, Vec::new());
+        for label in ["Open Folder(s)", "Preferences", "Exit"] {
+            let position = text_position(&output, label);
+            assert!(
+                !output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.rect.contains(position) && rect.fill == BUTTON_BACKGROUND)
+                }),
+                "{label} should retain the menu background"
+            );
+        }
+    }
+
+    #[test]
     fn menus_preferences_and_inputs_use_the_shared_background() {
         let context = egui::Context::default();
         let mut viewer = Viewer::new(context.clone());
@@ -1200,8 +1290,6 @@ mod tests {
             style.visuals.faint_bg_color,
             style.visuals.code_bg_color,
             style.visuals.widgets.noninteractive.bg_fill,
-            style.visuals.widgets.inactive.bg_fill,
-            style.visuals.widgets.inactive.weak_bg_fill,
         ] {
             assert_eq!(color, BACKGROUND);
         }

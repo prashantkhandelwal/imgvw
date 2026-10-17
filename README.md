@@ -5,8 +5,11 @@ Use **File > Open Folder(s)** to choose an image folder (one folder at a time),
 **File > Preferences** to configure the app, or **File > Exit** to close it.
 Use Ctrl+O to open a folder.
 The top bar contains the File menu with larger menu text.
+The folder heading shows the folder name and total image count in either view.
 Menus, panels, Preferences, the photo grid, and the preview canvas share the
 same dark gray background.
+Buttons outside the menu bar and its dropdowns use a lighter gray fill, with
+distinct hover, pressed, and selected states.
 
 Photos open in a dark, full-window thumbnail grid. Adjust the thumbnail size
 with the slider at the bottom right. Click a photo to select it; double-click

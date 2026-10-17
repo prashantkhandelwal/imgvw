@@ -181,18 +181,38 @@ pub fn supported(path: &Path) -> bool {
 }
 
 pub fn scan_folder(path: &Path) -> Result<Vec<PathBuf>, String> {
-    let entries = fs::read_dir(path).map_err(|error| format!("Cannot read folder: {error}"))?;
+    let mut directories = vec![path.to_owned()];
     let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("Cannot read folder entry: {error}"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("Cannot inspect {}: {error}", entry.path().display()))?;
-        if file_type.is_file() && supported(&entry.path()) {
-            paths.push(entry.path());
+    while let Some(directory) = directories.pop() {
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("Cannot read folder {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Cannot read folder entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let entry_path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("Cannot inspect {}: {error}", entry_path.display()))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                directories.push(entry_path);
+            } else if file_type.is_file() && supported(&entry_path) {
+                paths.push(entry_path);
+            }
         }
     }
-    paths.sort_by_cached_key(|path| path.file_name().unwrap_or_default().to_ascii_lowercase());
+    paths.sort_by_cached_key(|path| {
+        (
+            path.file_name().unwrap_or_default().to_ascii_lowercase(),
+            path.clone(),
+        )
+    });
     Ok(paths)
 }
 
@@ -310,6 +330,48 @@ mod tests {
             .collect();
         assert_eq!(names, ["A.jpg", "z.PNG"]);
         assert!(scan_folder(&folder.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn scans_nested_folders_and_preserves_duplicate_filenames() {
+        let folder = tempfile::tempdir().unwrap();
+        let nested = folder.path().join("nested.jpg");
+        let deep = nested.join("deeper");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir(folder.path().join("empty")).unwrap();
+        let expected = vec![
+            folder.path().join("A.jpg"),
+            nested.join("A.jpg"),
+            nested.join("b.WeBp"),
+            deep.join("c.PNG"),
+            folder.path().join("z.PNG"),
+        ];
+        for path in &expected {
+            fs::write(path, []).unwrap();
+        }
+        fs::write(deep.join("notes.txt"), []).unwrap();
+        fs::write(deep.join("no-extension"), []).unwrap();
+        assert_eq!(scan_folder(folder.path()).unwrap(), expected);
+        assert!(
+            scan_folder(&deep.join("notes.txt"))
+                .unwrap_err()
+                .contains(&deep.join("notes.txt").display().to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_does_not_follow_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let folder = tempfile::tempdir().unwrap();
+        let nested = folder.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let image = nested.join("photo.png");
+        fs::write(&image, []).unwrap();
+        symlink(folder.path(), nested.join("parent")).unwrap();
+        symlink(&image, folder.path().join("linked.png")).unwrap();
+        assert_eq!(scan_folder(folder.path()).unwrap(), vec![image]);
     }
 
     #[test]

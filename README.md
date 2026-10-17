@@ -4,6 +4,11 @@ Image viewer in rust.
 Use **File > Open Folder(s)** to choose an image folder (one folder at a time),
 **File > Preferences** to configure the app, or **File > Exit** to close it.
 Use Ctrl+O to open a folder.
+Opening a folder includes supported images from all of its subfolders.
+Symbolic links are not followed. Images are sorted by filename (case-insensitive),
+with the full path breaking ties; matching filenames in different folders are
+kept as separate images. Folder counts include all discovered images. An
+unreadable subfolder reports an error rather than silently showing a partial list.
 The top bar contains the File menu with larger menu text.
 The folder heading shows the folder name and total image count in either view.
 Menus, panels, Preferences, the photo grid, and the preview canvas share the

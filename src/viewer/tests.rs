@@ -762,6 +762,40 @@ fn exif_details_are_hidden_until_clicked_and_can_be_collapsed() {
 }
 
 #[test]
+fn opening_a_folder_loads_nested_images_and_counts_them_in_both_views() {
+    let folder = tempfile::tempdir().unwrap();
+    let nested = folder.path().join("nested");
+    let deep = nested.join("deeper");
+    std::fs::create_dir_all(&deep).unwrap();
+    let paths = vec![
+        folder.path().join("a.png"),
+        nested.join("b.png"),
+        deep.join("c.png"),
+    ];
+    for (index, path) in paths.iter().enumerate() {
+        image::RgbaImage::new(40 + index as u32 * 20, 20)
+            .save(path)
+            .unwrap();
+    }
+    let context = egui::Context::default();
+    let mut viewer = Viewer::new(context.clone());
+    viewer.open_folder(folder.path().to_owned(), &context);
+    wait_until(&mut viewer, &context, |viewer| {
+        viewer.preview.is_some() && viewer.thumbnails.len() == 3
+    });
+    assert_eq!(viewer.paths, paths);
+    assert_eq!(viewer.folder.as_deref(), Some(folder.path()));
+    for grid_view in [true, false] {
+        viewer.grid_view = grid_view;
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, "3 images");
+    }
+    viewer.select(2);
+    wait_until(&mut viewer, &context, |viewer| viewer.preview.is_some());
+    assert_eq!(viewer.metadata.as_ref().unwrap().width, 80);
+}
+
+#[test]
 fn ui_loads_navigates_and_discards_results_from_previous_folder() {
     let folder = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();

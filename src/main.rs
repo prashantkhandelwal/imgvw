@@ -9,6 +9,8 @@ use loader::{Event, Kind, Loader, Metadata, Request};
 
 const ACCENT: Color32 = Color32::from_rgb(239, 171, 86);
 const BACKGROUND: Color32 = Color32::BLACK;
+const CHROME: Color32 = Color32::from_rgb(43, 43, 43);
+const MENU_FONT_SIZE: f32 = 16.0;
 const MAX_THUMBNAILS: usize = 256;
 const MAX_PENDING: usize = 48;
 
@@ -34,6 +36,9 @@ struct Viewer {
     folder_error: Option<String>,
     frame: u64,
     reveal_selected: bool,
+    preferences_open: bool,
+    grid_view: bool,
+    thumbnail_size: f32,
 }
 
 impl Viewer {
@@ -62,6 +67,9 @@ impl Viewer {
             folder_error: None,
             frame: 0,
             reveal_selected: false,
+            preferences_open: false,
+            grid_view: true,
+            thumbnail_size: 144.0,
         }
     }
 
@@ -94,6 +102,7 @@ impl Viewer {
         self.metadata = None;
         self.folder_error = None;
         self.scanning = true;
+        self.grid_view = true;
     }
 
     fn select(&mut self, index: usize) {
@@ -217,29 +226,233 @@ impl Viewer {
     }
 
     fn toolbar(&mut self, context: &egui::Context) {
+        egui::TopBottomPanel::top("menu_bar")
+            .frame(egui::Frame::new().fill(CHROME).inner_margin(6.0))
+            .show(context, |ui| {
+                ui.style_mut().text_styles.insert(
+                    egui::TextStyle::Button,
+                    egui::FontId::proportional(MENU_FONT_SIZE),
+                );
+                ui.style_mut().text_styles.insert(
+                    egui::TextStyle::Body,
+                    egui::FontId::proportional(MENU_FONT_SIZE),
+                );
+                ui.spacing_mut().button_padding = Vec2::new(10.0, 5.0);
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().interact_size.y = 28.0;
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui
+                            .add_enabled(self.picker.is_none(), egui::Button::new("Open Folder(s)"))
+                            .clicked()
+                        {
+                            self.pick_folder(context);
+                            ui.close_menu();
+                        }
+                        if ui.button("Preferences").clicked() {
+                            self.preferences_open = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Exit").clicked() {
+                            context.send_viewport_cmd(egui::ViewportCommand::Close);
+                            ui.close_menu();
+                        }
+                    });
+                });
+            });
+        egui::Window::new("Preferences")
+            .open(&mut self.preferences_open)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("Default location");
+                ui.weak("The default folder location is not configurable yet.");
+            });
         egui::TopBottomPanel::top("toolbar").show(context, |ui| {
-            ui.add_space(10.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("IMGVW").strong().size(22.0).color(ACCENT));
-                ui.separator();
-                if ui
-                    .add_enabled(self.picker.is_none(), egui::Button::new("Open folder..."))
-                    .clicked()
-                {
-                    self.pick_folder(context);
-                }
+                ui.label(RichText::new("All Photos").strong().size(18.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("{} photos", self.paths.len()));
+                });
+            });
+            ui.add_space(6.0);
+        });
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(egui::Frame::new().fill(CHROME).inner_margin(8.0))
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.grid_view, "Photos").clicked() {
+                        self.grid_view = true;
+                        self.reveal_selected = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected.is_some(),
+                            egui::Button::new("Preview").selected(!self.grid_view),
+                        )
+                        .clicked()
+                    {
+                        self.grid_view = false;
+                        self.reveal_selected = true;
+                    }
+                    ui.separator();
+                    ui.weak("Ctrl+O: open folder");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.thumbnail_size, 80.0..=240.0)
+                                    .show_value(false)
+                                    .text("Thumbnail size"),
+                            )
+                            .changed()
+                        {
+                            self.reveal_selected = true;
+                        }
+                    });
+                });
+            });
+        egui::TopBottomPanel::top("folder_heading").show(context, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
                 if self.scanning {
                     ui.spinner();
                     ui.label("Reading folder...");
                 } else if let Some(folder) = &self.folder {
-                    ui.add(egui::Label::new(folder.display().to_string()).truncate())
+                    let name = folder
+                        .file_name()
+                        .unwrap_or(folder.as_os_str())
+                        .to_string_lossy();
+                    ui.add(egui::Label::new(RichText::new(name).strong()).truncate())
                         .on_hover_text(folder.display().to_string());
                 } else {
-                    ui.weak("Your images, without the distractions.");
+                    ui.weak("Open a folder to browse your photos");
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(6.0);
         });
+    }
+
+    fn grid(&mut self, ui: &mut egui::Ui) {
+        let gap = 4.0;
+        let columns = ((ui.available_width() + gap) / (self.thumbnail_size + gap))
+            .floor()
+            .max(1.0) as usize;
+        let width = ((ui.available_width() - gap * (columns - 1) as f32) / columns as f32).max(1.0);
+        let height = width * 0.68;
+        let stride = height + gap;
+        let rows = self.paths.len().div_ceil(columns);
+        let mut scroll = egui::ScrollArea::vertical().id_salt(("grid", self.generation));
+        if self.reveal_selected
+            && let Some(index) = self.selected
+        {
+            scroll = scroll.vertical_scroll_offset(
+                ((index / columns) as f32 * stride
+                    - (ui.available_height() / 2.0 - height / 2.0).max(0.0))
+                .max(0.0),
+            );
+        }
+        self.reveal_selected = false;
+        scroll.show_viewport(ui, |ui, viewport| {
+            ui.set_min_size(Vec2::new(ui.available_width(), rows as f32 * stride));
+            let first = (viewport.min.y / stride).floor().max(0.0) as usize;
+            let last = ((viewport.max.y / stride).ceil() as usize + 1).min(rows);
+            let origin = ui.min_rect().min;
+            for row in first..last {
+                for column in 0..columns {
+                    let index = row * columns + column;
+                    if index >= self.paths.len() {
+                        break;
+                    }
+                    let rect = egui::Rect::from_min_size(
+                        origin + Vec2::new(column as f32 * (width + gap), row as f32 * stride),
+                        Vec2::new(width, height),
+                    );
+                    self.thumbnail(ui, index, rect, false);
+                }
+            }
+        });
+    }
+
+    fn thumbnail(&mut self, ui: &mut egui::Ui, index: usize, rect: egui::Rect, name: bool) {
+        let response = ui.allocate_rect(rect, egui::Sense::click());
+        let active = self.selected == Some(index);
+        ui.painter().rect_filled(rect, 0.0, CHROME);
+        let image_rect = if name {
+            egui::Rect::from_min_size(rect.min + Vec2::splat(5.0), Vec2::new(106.0, 69.0))
+        } else {
+            rect.shrink(2.0)
+        };
+        if let Some(thumbnail) = self.thumbnails.get_mut(&index) {
+            thumbnail.last_used = self.frame;
+            let size = thumbnail.texture.size_vec2();
+            let fitted = size * (image_rect.width() / size.x).min(image_rect.height() / size.y);
+            ui.painter().image(
+                thumbnail.texture.id(),
+                egui::Rect::from_center_size(image_rect.center(), fitted),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.painter().text(
+                image_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                if self.errors.contains_key(&index) {
+                    "Cannot load"
+                } else {
+                    "Loading..."
+                },
+                egui::FontId::proportional(12.0),
+                Color32::GRAY,
+            );
+            if !self.errors.contains_key(&index)
+                && !self.pending.contains(&index)
+                && self.pending.len() < MAX_PENDING
+            {
+                self.pending.insert(index);
+                self.loader.request(Request {
+                    generation: self.generation,
+                    index,
+                    path: self.paths[index].clone(),
+                    kind: Kind::Thumbnail,
+                });
+            }
+        }
+        if active {
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(2.0, Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let filename = self.paths[index]
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        if name {
+            let text_rect =
+                egui::Rect::from_min_size(rect.min + Vec2::new(6.0, 78.0), Vec2::new(104.0, 17.0));
+            ui.painter().with_clip_rect(text_rect).text(
+                text_rect.left_top(),
+                egui::Align2::LEFT_TOP,
+                &filename,
+                egui::FontId::proportional(11.0),
+                Color32::LIGHT_GRAY,
+            );
+        }
+        let response = response.on_hover_text(self.errors.get(&index).map_or_else(
+            || self.paths[index].display().to_string(),
+            |error| format!("{filename}\n{error}"),
+        ));
+        if response.clicked() || response.double_clicked() {
+            self.select(index);
+        }
+        if response.double_clicked() {
+            self.grid_view = false;
+            self.reveal_selected = true;
+        }
     }
 
     fn filmstrip(&mut self, context: &egui::Context) {
@@ -278,89 +491,7 @@ impl Viewer {
                             origin + Vec2::new(index as f32 * stride, 3.0),
                             Vec2::new(cell_width, 100.0),
                         );
-                        let response = ui.allocate_rect(rect, egui::Sense::click());
-                        let active = selected == Some(index);
-                        ui.painter().rect_filled(
-                            rect,
-                            6.0,
-                            if active {
-                                ACCENT.gamma_multiply(0.22)
-                            } else {
-                                BACKGROUND
-                            },
-                        );
-                        if active {
-                            ui.painter().rect_stroke(
-                                rect,
-                                6.0,
-                                egui::Stroke::new(1.5, ACCENT),
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        let image_rect = egui::Rect::from_min_size(
-                            rect.min + Vec2::splat(5.0),
-                            Vec2::new(106.0, 69.0),
-                        );
-                        if let Some(thumbnail) = self.thumbnails.get_mut(&index) {
-                            thumbnail.last_used = self.frame;
-                            let size = thumbnail.texture.size_vec2();
-                            let fitted = size
-                                * (image_rect.width() / size.x).min(image_rect.height() / size.y);
-                            ui.painter().image(
-                                thumbnail.texture.id(),
-                                egui::Rect::from_center_size(image_rect.center(), fitted),
-                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                        } else {
-                            let label = if self.errors.contains_key(&index) {
-                                "Cannot load"
-                            } else {
-                                "Loading..."
-                            };
-                            ui.painter().text(
-                                image_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                label,
-                                egui::FontId::proportional(12.0),
-                                Color32::GRAY,
-                            );
-                            if !self.errors.contains_key(&index)
-                                && !self.pending.contains(&index)
-                                && self.pending.len() < MAX_PENDING
-                            {
-                                self.pending.insert(index);
-                                self.loader.request(Request {
-                                    generation: self.generation,
-                                    index,
-                                    path: self.paths[index].clone(),
-                                    kind: Kind::Thumbnail,
-                                });
-                            }
-                        }
-                        let name = self.paths[index]
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        let text_rect = egui::Rect::from_min_size(
-                            rect.min + Vec2::new(6.0, 78.0),
-                            Vec2::new(104.0, 17.0),
-                        );
-                        let painter = ui.painter().with_clip_rect(text_rect);
-                        painter.text(
-                            text_rect.left_top(),
-                            egui::Align2::LEFT_TOP,
-                            &name,
-                            egui::FontId::proportional(11.0),
-                            if active { ACCENT } else { Color32::LIGHT_GRAY },
-                        );
-                        let response = response.on_hover_text(self.errors.get(&index).map_or_else(
-                            || self.paths[index].display().to_string(),
-                            |error| format!("{name}\n{error}"),
-                        ));
-                        if response.clicked() {
-                            self.select(index);
-                        }
+                        self.thumbnail(ui, index, rect, true);
                     }
                 });
             });
@@ -459,6 +590,15 @@ impl Viewer {
         self.frame += 1;
         self.receive(context);
         if self.picker.is_none() && !context.wants_keyboard_input() {
+            if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.grid_view = true;
+                self.reveal_selected = true;
+            }
+            if context.input(|input| input.key_pressed(egui::Key::Enter)) && self.selected.is_some()
+            {
+                self.grid_view = false;
+                self.reveal_selected = true;
+            }
             if context.input(|input| input.key_pressed(egui::Key::ArrowRight)) {
                 self.navigate(true);
             }
@@ -470,12 +610,22 @@ impl Viewer {
             self.pick_folder(context);
         }
         self.toolbar(context);
-        self.filmstrip(context);
-        self.properties(context);
+        if !self.grid_view {
+            self.filmstrip(context);
+            self.properties(context);
+        }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(20.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(BACKGROUND)
+                    .inner_margin(if self.grid_view { 2.0 } else { 20.0 }),
+            )
             .show(context, |ui| {
-                if let Some(texture) = &self.preview {
+                if self.grid_view && !self.paths.is_empty() {
+                    self.grid(ui);
+                } else if !self.grid_view
+                    && let Some(texture) = &self.preview
+                {
                     let available = ui.available_size();
                     let size = texture.size_vec2();
                     let fitted = size * (available.x / size.x).min(available.y / size.y).min(1.0);
@@ -588,8 +738,101 @@ mod tests {
         }
     }
 
+    fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + Vec2::splat(5.0))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing menu text: {label}"))
+    }
+
+    fn click(viewer: &mut Viewer, context: &egui::Context, position: egui::Pos2) {
+        for pressed in [true, false] {
+            render(
+                viewer,
+                context,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
     #[test]
-    fn all_panel_backgrounds_match_the_preview() {
+    fn menu_bar_has_larger_text_without_navigation_buttons() {
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, "File");
+        assert!(!output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text)
+                if matches!(text.galley.job.text.as_str(), "\u{2190}" | "\u{2192}" | "Back" | "Forward"))
+        }));
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text)
+            if text.galley.job.text == "File"
+            && text.galley.job.sections.iter().all(|section| {
+                section.format.font_id.size == MENU_FONT_SIZE
+            }))
+        }));
+    }
+
+    #[test]
+    fn file_menu_opens_preferences_and_requests_exit() {
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        let file_position = text_position(&output, "File");
+        click(&mut viewer, &context, file_position);
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, "Open Folder(s)");
+        text_position(&output, "Exit");
+        click(&mut viewer, &context, text_position(&output, "Preferences"));
+        assert!(viewer.preferences_open);
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, "Default location");
+
+        click(&mut viewer, &context, file_position);
+        let output = render(&mut viewer, &context, Vec::new());
+        let exit_position = text_position(&output, "Exit");
+        let mut closed = false;
+        for pressed in [true, false] {
+            let output = render(
+                &mut viewer,
+                &context,
+                vec![
+                    egui::Event::PointerMoved(exit_position),
+                    egui::Event::PointerButton {
+                        pos: exit_position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            closed |= output
+                .viewport_output
+                .values()
+                .any(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close));
+        }
+        assert!(closed, "Exit should request that the native window close");
+    }
+
+    #[test]
+    fn grid_uses_dark_chrome_and_black_canvas() {
         assert_eq!(BACKGROUND, Color32::from_rgb(0, 0, 0));
         let context = egui::Context::default();
         let mut viewer = Viewer::new(context.clone());
@@ -597,20 +840,92 @@ mod tests {
         let output = render(&mut viewer, &context, Vec::new());
         assert_eq!(context.style().visuals.panel_fill, BACKGROUND);
         assert_eq!(context.style().visuals.window_fill, BACKGROUND);
-        for point in [
-            egui::pos2(5.0, 5.0),
-            egui::pos2(5.0, 810.0),
-            egui::pos2(1270.0, 70.0),
-            egui::pos2(5.0, 70.0),
+        for (point, color) in [
+            (egui::pos2(5.0, 5.0), CHROME),
+            (egui::pos2(5.0, 810.0), CHROME),
+            (egui::pos2(1270.0, 170.0), BACKGROUND),
+            (egui::pos2(5.0, 170.0), BACKGROUND),
         ] {
             assert!(
                 output.shapes.iter().any(|shape| {
                     matches!(&shape.shape, egui::Shape::Rect(rect)
-                    if rect.rect.contains(point) && rect.fill == BACKGROUND)
+                    if rect.rect.contains(point) && rect.fill == color)
                 }),
                 "Missing matching panel background at {point:?}"
             );
         }
+    }
+
+    #[test]
+    fn grid_size_control_and_preview_round_trip() {
+        fn selected_rect(output: &egui::FullOutput) -> egui::Rect {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.stroke.color == Color32::WHITE && rect.stroke.width == 2.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("Selected thumbnail should have a white outline")
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(40, 20)
+            .save(folder.path().join("photo.png"))
+            .unwrap();
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        assert!(viewer.grid_view);
+        viewer.open_folder(folder.path().to_owned(), &context);
+        wait_until(&mut viewer, &context, |viewer| {
+            viewer.preview.is_some() && viewer.thumbnails.contains_key(&0)
+        });
+        let output = render(&mut viewer, &context, Vec::new());
+        let initial = selected_rect(&output);
+        assert!(initial.top() < 160.0);
+        assert!(initial.width() > initial.height());
+        let slider_position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) if circle.center.y > 780.0 => {
+                    Some(circle.center + Vec2::new(20.0, 0.0))
+                }
+                _ => None,
+            })
+            .expect("Thumbnail size slider handle should be visible");
+        click(&mut viewer, &context, slider_position);
+        assert_ne!(
+            viewer.thumbnail_size, 144.0,
+            "Slider must change thumbnail size"
+        );
+        let output = render(&mut viewer, &context, Vec::new());
+        let resized = selected_rect(&output);
+        assert_ne!(resized.width(), initial.width());
+        click(&mut viewer, &context, resized.center());
+        click(&mut viewer, &context, resized.center());
+        assert!(!viewer.grid_view, "Double-click should open preview");
+        let output = render(&mut viewer, &context, Vec::new());
+        text_position(&output, "IMAGE DETAILS");
+        text_position(&output, "40 x 20 px");
+        render(
+            &mut viewer,
+            &context,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(viewer.grid_view);
+        let output = render(&mut viewer, &context, Vec::new());
+        assert_eq!(selected_rect(&output).width(), resized.width());
     }
 
     #[test]
@@ -631,16 +946,16 @@ mod tests {
             assert_eq!(context.theme(), egui::Theme::Dark);
             assert_eq!(context.style().visuals.panel_fill, Color32::BLACK);
             assert_eq!(context.style().visuals.window_fill, Color32::BLACK);
-            for point in [
-                egui::pos2(5.0, 5.0),
-                egui::pos2(5.0, 810.0),
-                egui::pos2(1270.0, 70.0),
-                egui::pos2(5.0, 70.0),
+            for (point, color) in [
+                (egui::pos2(5.0, 5.0), CHROME),
+                (egui::pos2(5.0, 810.0), CHROME),
+                (egui::pos2(1270.0, 170.0), BACKGROUND),
+                (egui::pos2(5.0, 170.0), BACKGROUND),
             ] {
                 assert!(
                     output.shapes.iter().any(|shape| {
                         matches!(&shape.shape, egui::Shape::Rect(rect)
-                        if rect.rect.contains(point) && rect.fill == Color32::BLACK)
+                        if rect.rect.contains(point) && rect.fill == color)
                     }),
                     "System theme {theme:?} changed panel background at {point:?}"
                 );
@@ -661,6 +976,7 @@ mod tests {
         ] {
             let context = egui::Context::default();
             let mut viewer = Viewer::new(context.clone());
+            viewer.grid_view = false;
             context.style_mut(|style| style.animation_time = 0.0);
             viewer.paths = vec![PathBuf::from("test.png")];
             viewer.selected = Some(0);
@@ -726,6 +1042,7 @@ mod tests {
         });
         assert_eq!(viewer.selected, Some(0));
         assert_eq!(viewer.metadata.as_ref().unwrap().width, 40);
+        viewer.grid_view = false;
         let output = render(&mut viewer, &context, Vec::new());
         let text_position = |label: &str| {
             output
@@ -803,7 +1120,7 @@ mod tests {
             viewer.preview.is_some() && !viewer.thumbnails.is_empty()
         });
         assert_eq!(viewer.paths.len(), 300);
-        assert!(viewer.thumbnails.len() < 30);
+        assert!(viewer.thumbnails.len() < 100);
         assert!(viewer.pending.len() <= MAX_PENDING);
         render(
             &mut viewer,
@@ -820,6 +1137,6 @@ mod tests {
         wait_until(&mut viewer, &context, |viewer| {
             viewer.preview.is_some() && viewer.thumbnails.contains_key(&299)
         });
-        assert!(viewer.thumbnails.len() < 40);
+        assert!(viewer.thumbnails.len() < 160);
     }
 }

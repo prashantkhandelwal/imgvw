@@ -38,6 +38,16 @@ switching views. Selecting a different image resets zoom to 100% (fitted) by
 default; enable **Retain zoom percentage between images** in Preferences to
 keep the current zoom instead.
 
+## Image details
+
+In Preview, the resizable right-hand side panel starts with **IMAGE DETAILS**
+at the top. It shows the selected image's filename, full path, pixel dimensions,
+file size, and format. The panel scrolls vertically when its contents exceed
+the available height.
+
+Expand **EXIF** to view metadata tags; this section is collapsed by default.
+Images without EXIF metadata show a message when the section is expanded.
+
 ## Preferences
 
 Preferences opens centered in the main window, with a wider folder field and

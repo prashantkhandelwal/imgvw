@@ -125,7 +125,9 @@ impl Viewer {
     }
 
     fn open_folder(&mut self, path: PathBuf, context: &egui::Context) {
-        self.generation = self.loader.open_folder(path.clone(), context.clone());
+        self.generation =
+            self.loader
+                .open_folder(path.clone(), self.settings.include_hidden, context.clone());
         self.folder = Some(path);
         self.paths.clear();
         self.selected = None;

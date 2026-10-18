@@ -27,6 +27,7 @@ pub struct Settings {
     pub default_folder: String,
     pub default_view: DefaultView,
     pub retain_zoom: bool,
+    pub include_hidden: bool,
 }
 
 pub fn path() -> Result<PathBuf, String> {
@@ -92,11 +93,13 @@ mod tests {
             default_folder: directory.path().to_str().unwrap().into(),
             default_view: DefaultView::Preview,
             retain_zoom: true,
+            include_hidden: true,
         };
         save(&path, &settings).unwrap();
         assert_eq!(load(&path).unwrap(), settings);
         settings.default_view = DefaultView::Grid;
         settings.retain_zoom = false;
+        settings.include_hidden = false;
         settings.default_folder.clear();
         save(&path, &settings).unwrap();
         assert_eq!(load(&path).unwrap(), settings);
@@ -147,6 +150,8 @@ mod tests {
         assert_eq!(settings.default_view, DefaultView::Preview);
         assert!(!settings.retain_zoom);
         assert!(!Settings::default().retain_zoom);
+        assert!(!settings.include_hidden);
+        assert!(!Settings::default().include_hidden);
     }
 
     #[test]

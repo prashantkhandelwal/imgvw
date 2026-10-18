@@ -468,6 +468,7 @@ fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
         default_folder: photos.to_str().unwrap().into(),
         default_view: DefaultView::Preview,
         retain_zoom: false,
+        include_hidden: false,
     };
     render(&mut viewer, &context, Vec::new());
     let output = render(&mut viewer, &context, Vec::new());
@@ -523,6 +524,60 @@ fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
     restarted.load_settings(&path, &context);
     assert!(restarted.grid_view);
     assert!(!restarted.settings.retain_zoom);
+}
+
+#[test]
+fn hidden_search_preference_is_saved_and_used_when_opening_folders() {
+    let directory = tempfile::tempdir().unwrap();
+    let photos = directory.path().join("photos");
+    let hidden_folder = photos.join(".hidden");
+    std::fs::create_dir_all(&hidden_folder).unwrap();
+    let visible = photos.join("visible.png");
+    let hidden = hidden_folder.join("photo.png");
+    for path in [&visible, &hidden] {
+        image::RgbaImage::new(8, 4).save(path).unwrap();
+    }
+    std::fs::write(photos.join("._photo.png"), b"not a PNG").unwrap();
+    let path = directory.path().join("settings.json");
+    let context = egui::Context::default();
+    let mut viewer = Viewer::new(context.clone());
+    viewer.settings_path = Some(path.clone());
+    viewer.preferences_draft.default_folder = photos.display().to_string();
+    viewer.open_folder(photos.clone(), &context);
+    wait_until(&mut viewer, &context, |viewer| viewer.preview.is_some());
+    assert_eq!(viewer.paths, vec![visible.clone()]);
+    viewer.preferences_open = true;
+    render(&mut viewer, &context, Vec::new());
+    let output = render(&mut viewer, &context, Vec::new());
+    click(
+        &mut viewer,
+        &context,
+        text_position(&output, "Search hidden files and folders"),
+    );
+    assert!(viewer.preferences_draft.include_hidden);
+    assert!(!viewer.settings.include_hidden);
+    let output = render(&mut viewer, &context, Vec::new());
+    click(&mut viewer, &context, text_position(&output, "Save"));
+    assert!(viewer.settings.include_hidden);
+    assert!(settings::load(&path).unwrap().include_hidden);
+    assert_eq!(viewer.paths, vec![visible.clone()]);
+    viewer.open_folder(photos.clone(), &context);
+    wait_until(&mut viewer, &context, |viewer| {
+        !viewer.scanning && viewer.preview.is_some() && viewer.thumbnails.len() == 2
+    });
+    assert_eq!(viewer.paths, vec![hidden.clone(), visible.clone()]);
+    assert!(viewer.errors.is_empty());
+    assert!(viewer.preview_error.is_none());
+    assert_eq!(viewer.scan_progress.images_found, 2);
+    let mut restarted = Viewer::new(context.clone());
+    restarted.load_settings(&path, &context);
+    wait_until(&mut restarted, &context, |viewer| viewer.preview.is_some());
+    assert_eq!(restarted.paths, vec![hidden, visible.clone()]);
+    viewer.preferences_draft.include_hidden = false;
+    assert!(viewer.save_preferences());
+    viewer.open_folder(photos, &context);
+    wait_until(&mut viewer, &context, |viewer| viewer.preview.is_some());
+    assert_eq!(viewer.paths, vec![visible]);
 }
 
 #[test]

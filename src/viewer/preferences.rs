@@ -132,6 +132,13 @@ impl Viewer {
                 }
             });
             ui.weak("Opened automatically when viewr starts. Leave empty for no folder.");
+            ui.checkbox(
+                &mut self.preferences_draft.include_hidden,
+                "Search hidden files and folders",
+            )
+            .on_hover_text(
+                "Applies when opening a folder. Hidden images that cannot be decoded are skipped.",
+            );
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label("Default view");

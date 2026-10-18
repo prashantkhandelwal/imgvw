@@ -125,7 +125,12 @@ impl Loader {
         }
     }
 
-    pub fn open_folder(&self, path: PathBuf, context: eframe::egui::Context) -> u64 {
+    pub fn open_folder(
+        &self,
+        path: PathBuf,
+        include_hidden: bool,
+        context: eframe::egui::Context,
+    ) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.queue
             .0
@@ -138,7 +143,7 @@ impl Loader {
             let mut latest = ScanProgress::default();
             let mut reported = ScanProgress::default();
             let mut last_update = Instant::now();
-            let result = scan_folder(&path, |progress| {
+            let result = scan_folder(&path, include_hidden, |progress| {
                 latest = progress;
                 if progress.files_read == 1
                     || progress.files_read - reported.files_read >= SCAN_PROGRESS_BATCH_SIZE
@@ -218,12 +223,13 @@ pub fn supported(path: &Path) -> bool {
 
 pub fn scan_folder(
     path: &Path,
+    include_hidden: bool,
     mut on_progress: impl FnMut(ScanProgress),
 ) -> Result<Vec<PathBuf>, String> {
-    let mut directories = vec![path.to_owned()];
+    let mut directories = vec![(path.to_owned(), false)];
     let mut paths = Vec::new();
     let mut progress = ScanProgress::default();
-    while let Some(directory) = directories.pop() {
+    while let Some((directory, hidden_parent)) = directories.pop() {
         let entries = fs::read_dir(&directory)
             .map_err(|error| format!("Cannot read folder {}: {error}", directory.display()))?;
         for entry in entries {
@@ -234,19 +240,47 @@ pub fn scan_folder(
                 )
             })?;
             let entry_path = entry.path();
+            let hidden = hidden_parent || entry.file_name().as_encoded_bytes().starts_with(b".");
+            if hidden && !include_hidden {
+                continue;
+            }
             let file_type = entry
                 .file_type()
                 .map_err(|error| format!("Cannot inspect {}: {error}", entry_path.display()))?;
             if file_type.is_symlink() {
                 continue;
             }
+            #[cfg(windows)]
+            let hidden = {
+                use std::os::windows::fs::MetadataExt;
+
+                let metadata = entry
+                    .metadata()
+                    .map_err(|error| format!("Cannot inspect {}: {error}", entry_path.display()))?;
+                hidden || metadata.file_attributes() & 0x2 != 0
+            };
+            if hidden && !include_hidden {
+                continue;
+            }
             if file_type.is_dir() {
-                directories.push(entry_path);
+                directories.push((entry_path, hidden));
             } else if file_type.is_file() {
                 progress.files_read += 1;
                 if supported(&entry_path) {
-                    paths.push(entry_path);
-                    progress.images_found += 1;
+                    let validation = if hidden {
+                        decode(&entry_path, Kind::Preview).map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    match validation {
+                        Ok(()) => {
+                            paths.push(entry_path);
+                            progress.images_found += 1;
+                        }
+                        Err(error) => {
+                            eprintln!("Skipping hidden image {}: {error}", entry_path.display());
+                        }
+                    }
                 }
                 on_progress(progress);
             }
@@ -368,13 +402,143 @@ mod tests {
             fs::write(folder.path().join(name), []).unwrap();
         }
         fs::create_dir(folder.path().join("nested.jpg")).unwrap();
-        let names: Vec<_> = scan_folder(folder.path(), |_| {})
+        let names: Vec<_> = scan_folder(folder.path(), false, |_| {})
             .unwrap()
             .into_iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["A.jpg", "z.PNG"]);
-        assert!(scan_folder(&folder.path().join("missing"), |_| {}).is_err());
+        assert!(scan_folder(&folder.path().join("missing"), false, |_| {}).is_err());
+    }
+
+    #[test]
+    fn recursive_scan_skips_dot_files_and_folders_without_counting_them() {
+        let folder = tempfile::tempdir().unwrap();
+        let nested = folder.path().join("nested");
+        let hidden = folder.path().join(".hidden");
+        fs::create_dir(&nested).unwrap();
+        fs::create_dir(&hidden).unwrap();
+        for path in [
+            folder.path().join(".hidden.png"),
+            folder.path().join("._photo.png"),
+            folder.path().join(".notes.txt"),
+            nested.join(".hidden.jpg"),
+            hidden.join("photo.png"),
+        ] {
+            fs::write(path, []).unwrap();
+        }
+        let visible = nested.join("photo.png");
+        fs::write(&visible, []).unwrap();
+        fs::write(nested.join("notes.txt"), []).unwrap();
+        let mut updates = Vec::new();
+        assert_eq!(
+            scan_folder(folder.path(), false, |progress| updates.push(progress)).unwrap(),
+            vec![visible]
+        );
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates.last(),
+            Some(&ScanProgress {
+                files_read: 2,
+                images_found: 1,
+            })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_scan_skips_windows_hidden_files_and_folders_without_counting_them() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetFileAttributesW(name: *const u16, attributes: u32) -> i32;
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let hidden_folder = folder.path().join("hidden");
+        fs::create_dir(&hidden_folder).unwrap();
+        fs::write(hidden_folder.join("photo.png"), []).unwrap();
+        let hidden_image = folder.path().join("hidden.png");
+        let hidden_text = folder.path().join("hidden.txt");
+        fs::write(&hidden_image, []).unwrap();
+        fs::write(&hidden_text, []).unwrap();
+        for path in [&hidden_folder, &hidden_image, &hidden_text] {
+            let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let attributes = fs::metadata(path).unwrap().file_attributes() | 0x2;
+            // The path is null-terminated and remains valid throughout the call.
+            let result = unsafe { SetFileAttributesW(name.as_ptr(), attributes) };
+            assert_ne!(result, 0, "{}", std::io::Error::last_os_error());
+        }
+        let visible = folder.path().join("visible.png");
+        fs::write(&visible, []).unwrap();
+        let mut updates = Vec::new();
+        assert_eq!(
+            scan_folder(folder.path(), false, |progress| updates.push(progress)).unwrap(),
+            vec![visible.clone()]
+        );
+        assert_eq!(
+            updates,
+            vec![ScanProgress {
+                files_read: 1,
+                images_found: 1,
+            }]
+        );
+        image::RgbaImage::new(8, 4).save(&hidden_image).unwrap();
+        let hidden_child = hidden_folder.join("photo.png");
+        image::RgbaImage::new(8, 4).save(&hidden_child).unwrap();
+        fs::write(hidden_folder.join("invalid.png"), b"not an image").unwrap();
+        let mut updates = Vec::new();
+        assert_eq!(
+            scan_folder(folder.path(), true, |progress| updates.push(progress)).unwrap(),
+            vec![hidden_image, hidden_child, visible]
+        );
+        assert_eq!(
+            updates.last(),
+            Some(&ScanProgress {
+                files_read: 5,
+                images_found: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn hidden_search_includes_valid_images_and_skips_invalid_hidden_images() {
+        let folder = tempfile::tempdir().unwrap();
+        let hidden_folder = folder.path().join(".hidden");
+        fs::create_dir(&hidden_folder).unwrap();
+        let hidden_image = folder.path().join(".photo.png");
+        let hidden_child = hidden_folder.join("child.png");
+        for path in [&hidden_image, &hidden_child] {
+            image::RgbaImage::new(8, 4).save(path).unwrap();
+        }
+        for path in [
+            folder.path().join("._photo.png"),
+            hidden_folder.join("invalid.png"),
+            hidden_folder.join("notes.txt"),
+        ] {
+            fs::write(path, b"not an image").unwrap();
+        }
+        let visible = folder.path().join("visible.png");
+        fs::write(&visible, b"not an image").unwrap();
+        let mut updates = Vec::new();
+        assert_eq!(
+            scan_folder(folder.path(), true, |progress| updates.push(progress)).unwrap(),
+            vec![hidden_image, hidden_child, visible.clone()]
+        );
+        assert_eq!(
+            updates.last(),
+            Some(&ScanProgress {
+                files_read: 6,
+                images_found: 3,
+            })
+        );
+        assert_eq!(
+            scan_folder(folder.path(), false, |_| {}).unwrap(),
+            vec![visible],
+            "Visible files must retain existing lazy decoding behavior"
+        );
     }
 
     #[test]
@@ -396,9 +560,9 @@ mod tests {
         }
         fs::write(deep.join("notes.txt"), []).unwrap();
         fs::write(deep.join("no-extension"), []).unwrap();
-        assert_eq!(scan_folder(folder.path(), |_| {}).unwrap(), expected);
+        assert_eq!(scan_folder(folder.path(), false, |_| {}).unwrap(), expected);
         assert!(
-            scan_folder(&deep.join("notes.txt"), |_| {})
+            scan_folder(&deep.join("notes.txt"), false, |_| {})
                 .unwrap_err()
                 .contains(&deep.join("notes.txt").display().to_string())
         );
@@ -416,7 +580,7 @@ mod tests {
         fs::write(&image, []).unwrap();
         symlink(folder.path(), nested.join("parent")).unwrap();
         symlink(&image, folder.path().join("linked.png")).unwrap();
-        assert_eq!(scan_folder(folder.path(), |_| {}).unwrap(), vec![image]);
+        assert_eq!(scan_folder(folder.path(), false, |_| {}).unwrap(), vec![image]);
     }
 
     #[test]
@@ -433,7 +597,7 @@ mod tests {
             fs::write(path, []).unwrap();
         }
         let mut updates = Vec::new();
-        let images = scan_folder(folder.path(), |progress| updates.push(progress)).unwrap();
+        let images = scan_folder(folder.path(), false, |progress| updates.push(progress)).unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(updates.len(), 4);
         for (index, progress) in updates.iter().enumerate() {
@@ -449,7 +613,7 @@ mod tests {
         );
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            scan_folder(empty.path(), |_| panic!("No files should be reported"))
+            scan_folder(empty.path(), false, |_| panic!("No files should be reported"))
                 .unwrap()
                 .is_empty()
         );
@@ -546,7 +710,7 @@ mod tests {
         fs::write(folder.path().join("notes.txt"), b"not an image").unwrap();
         let context = eframe::egui::Context::default();
         let loader = Loader::new(context.clone());
-        let generation = loader.open_folder(folder.path().to_owned(), context);
+        let generation = loader.open_folder(folder.path().to_owned(), false, context);
         let mut progress_updates = Vec::new();
         let event = loop {
             let event = loader.events.recv_timeout(Duration::from_secs(5)).unwrap();

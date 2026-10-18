@@ -1,4 +1,5 @@
 mod controls;
+mod overlays;
 mod preferences;
 mod preview;
 mod theme;

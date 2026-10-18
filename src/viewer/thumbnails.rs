@@ -1,5 +1,6 @@
 use eframe::egui::{self, Color32, Vec2};
 
+use super::overlays;
 use super::theme::BACKGROUND;
 use super::{MAX_PENDING, Viewer};
 use crate::loader::{Kind, Request};
@@ -55,13 +56,15 @@ impl Viewer {
         } else {
             rect.shrink(2.0)
         };
+        let mut displayed_rect = image_rect;
         if let Some(thumbnail) = self.thumbnails.get_mut(&index) {
             thumbnail.last_used = self.frame;
             let size = thumbnail.texture.size_vec2();
             let fitted = size * (image_rect.width() / size.x).min(image_rect.height() / size.y);
+            displayed_rect = egui::Rect::from_center_size(image_rect.center(), fitted);
             ui.painter().image(
                 thumbnail.texture.id(),
-                egui::Rect::from_center_size(image_rect.center(), fitted),
+                displayed_rect,
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
@@ -112,6 +115,9 @@ impl Viewer {
                 egui::FontId::proportional(11.0),
                 Color32::LIGHT_GRAY,
             );
+        }
+        if response.hovered() && ui.rect_contains_pointer(displayed_rect) {
+            overlays::filename(ui, displayed_rect, &self.paths[index]);
         }
         let response = response.on_hover_text(self.errors.get(&index).map_or_else(
             || self.paths[index].display().to_string(),

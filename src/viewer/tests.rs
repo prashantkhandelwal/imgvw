@@ -76,6 +76,105 @@ fn click(viewer: &mut Viewer, context: &egui::Context, position: egui::Pos2) {
 }
 
 #[test]
+fn filename_hover_captions_are_shown_on_thumbnails_but_not_preview_images() {
+    fn visible_image(output: &egui::FullOutput, texture: egui::TextureId) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                    Some(mesh.calc_bounds().intersect(shape.clip_rect))
+                }
+                _ => None,
+            })
+            .expect("Image should be visible")
+    }
+
+    fn caption(
+        output: &egui::FullOutput,
+        name: &str,
+        image: egui::Rect,
+    ) -> Option<(egui::Pos2, Vec2, usize)> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == name && image.contains(text.pos) => {
+                Some((text.pos, text.galley.size(), text.galley.rows.len()))
+            }
+            _ => None,
+        })
+    }
+
+    for name in [
+        "photo.png".to_string(),
+        format!("{}.png", "long-name-".repeat(14)),
+    ] {
+        let folder = tempfile::tempdir().unwrap();
+        image::RgbaImage::new(1280, 960)
+            .save(folder.path().join(&name))
+            .unwrap();
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let mut viewer = Viewer::new(context.clone());
+        viewer.open_folder(folder.path().to_owned(), &context);
+        wait_until(&mut viewer, &context, |viewer| {
+            viewer.preview.is_some() && viewer.thumbnails.contains_key(&0)
+        });
+        for (grid_view, zoom) in [(true, 100.0), (false, 100.0), (false, 400.0)] {
+            viewer.grid_view = grid_view;
+            viewer.preview_zoom = zoom;
+            render(
+                &mut viewer,
+                &context,
+                vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))],
+            );
+            let output = render(&mut viewer, &context, Vec::new());
+            let texture = if grid_view {
+                viewer.thumbnails[&0].texture.id()
+            } else {
+                viewer.preview.as_ref().unwrap().id()
+            };
+            let visible = visible_image(&output, texture);
+            assert!(
+                caption(&output, &name, visible).is_none(),
+                "Caption must be hidden before hover"
+            );
+            let output = render(
+                &mut viewer,
+                &context,
+                vec![egui::Event::PointerMoved(visible.center())],
+            );
+            let visible = visible_image(&output, texture);
+            if grid_view {
+                let (position, size, rows) = caption(&output, &name, visible)
+                    .expect("Hovered thumbnail should show its filename");
+                assert!(
+                    position.y >= visible.bottom() - 30.0,
+                    "Filename should be at the visible bottom"
+                );
+                assert_eq!(rows, 1, "Long filenames should stay on one line");
+                assert!(
+                    size.x <= visible.width() - 12.0 + 1.0,
+                    "Caption should fit within the image"
+                );
+            } else {
+                assert!(
+                    caption(&output, &name, visible).is_none(),
+                    "The preview image must not show a filename hover caption"
+                );
+            }
+            let output = render(
+                &mut viewer,
+                &context,
+                vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))],
+            );
+            assert!(
+                caption(&output, &name, visible).is_none(),
+                "Caption must disappear after leaving"
+            );
+        }
+    }
+}
+
+#[test]
 fn folder_heading_shows_the_total_image_count_in_both_views() {
     for grid_view in [true, false] {
         for count in [0, 1, 24] {

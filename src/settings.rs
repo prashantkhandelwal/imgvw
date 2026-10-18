@@ -26,18 +26,28 @@ impl DefaultView {
 pub struct Settings {
     pub default_folder: String,
     pub default_view: DefaultView,
+    pub retain_zoom: bool,
 }
 
 pub fn path() -> Result<PathBuf, String> {
     dirs::config_dir()
-        .map(|directory| directory.join("imgvw").join("settings.json"))
+        .map(|directory| directory.join("viewr").join("settings.json"))
         .ok_or_else(|| "Cannot locate the user's settings directory.".into())
 }
 
 pub fn load(path: &Path) -> Result<Settings, String> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Settings::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if path.file_name().is_some_and(|name| name == "settings.json")
+                && let Some(directory) = path
+                    .parent()
+                    .filter(|directory| directory.file_name().is_some_and(|name| name == "viewr"))
+            {
+                return load(&directory.with_file_name("imgvw").join("settings.json"));
+            }
+            return Ok(Settings::default());
+        }
         Err(error) => {
             return Err(format!(
                 "Cannot read settings at {}: {error}",
@@ -76,19 +86,67 @@ mod tests {
     #[test]
     fn missing_settings_use_defaults_and_saved_settings_can_be_replaced() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("imgvw").join("settings.json");
+        let path = directory.path().join("viewr").join("settings.json");
         assert_eq!(load(&path).unwrap(), Settings::default());
         let mut settings = Settings {
             default_folder: directory.path().to_str().unwrap().into(),
             default_view: DefaultView::Preview,
+            retain_zoom: true,
         };
         save(&path, &settings).unwrap();
         assert_eq!(load(&path).unwrap(), settings);
         settings.default_view = DefaultView::Grid;
+        settings.retain_zoom = false;
         settings.default_folder.clear();
         save(&path, &settings).unwrap();
         assert_eq!(load(&path).unwrap(), settings);
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn viewr_settings_fall_back_to_imgvw_until_saved_in_the_new_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("viewr").join("settings.json");
+        let legacy_path = directory.path().join("imgvw").join("settings.json");
+        let legacy = Settings {
+            default_view: DefaultView::Preview,
+            retain_zoom: true,
+            ..Settings::default()
+        };
+        save(&legacy_path, &legacy).unwrap();
+        let legacy_contents = fs::read(&legacy_path).unwrap();
+        assert_eq!(load(&path).unwrap(), legacy);
+        assert!(!path.exists(), "Loading must not write settings");
+
+        let updated = Settings::default();
+        save(&path, &updated).unwrap();
+        assert_eq!(load(&path).unwrap(), updated);
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_contents);
+
+        fs::write(&path, b"invalid json").unwrap();
+        assert!(
+            load(&path)
+                .unwrap_err()
+                .contains(&path.display().to_string()),
+            "Invalid viewr settings must be reported, not replaced with legacy settings"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::write(&legacy_path, b"invalid json").unwrap();
+        assert!(
+            load(&path)
+                .unwrap_err()
+                .contains(&legacy_path.display().to_string()),
+            "Invalid legacy settings must be reported"
+        );
+    }
+
+    #[test]
+    fn older_settings_reset_zoom_by_default() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"default_folder":"","default_view":"preview"}"#).unwrap();
+        assert_eq!(settings.default_view, DefaultView::Preview);
+        assert!(!settings.retain_zoom);
+        assert!(!Settings::default().retain_zoom);
     }
 
     #[test]

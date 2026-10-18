@@ -148,6 +148,7 @@ impl Viewer {
                 let selected = self.selected;
                 let reveal = self.reveal_selected;
                 self.reveal_selected = false;
+                ui.style_mut().always_scroll_the_only_direction = true;
                 let mut scroll =
                     egui::ScrollArea::horizontal().id_salt(("thumbnails", self.generation));
                 if reveal && let Some(index) = selected {

@@ -18,16 +18,16 @@ impl Viewer {
                 if self.grid_view && !self.paths.is_empty() {
                     self.grid(ui);
                 } else if !self.grid_view
-                    && let Some(texture) = &self.preview
+                    && let Some(texture) = self.preview.clone()
                 {
-                    self.preview_image(ui, texture);
+                    self.preview_image(ui, &texture);
                 } else {
                     self.empty_state(ui, context);
                 }
             });
     }
 
-    fn preview_image(&self, ui: &mut egui::Ui, texture: &TextureHandle) {
+    fn preview_image(&mut self, ui: &mut egui::Ui, texture: &TextureHandle) {
         let available = ui.available_size();
         let size = texture.size_vec2();
         let fitted = size * (available.x / size.x).min(available.y / size.y).min(1.0);
@@ -51,11 +51,20 @@ impl Viewer {
                     image_rect.intersect(ui.clip_rect()),
                     ui.id().with("preview_image"),
                     if can_pan {
-                        egui::Sense::drag()
+                        egui::Sense::click_and_drag()
                     } else {
-                        egui::Sense::hover()
+                        egui::Sense::click()
                     },
                 );
+                if response.hovered() {
+                    let delta =
+                        ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta.y));
+                    if delta != 0.0 {
+                        self.preview_zoom =
+                            (self.preview_zoom * (delta * 0.002).exp()).clamp(25.0, 400.0);
+                        ui.ctx().request_repaint();
+                    }
+                }
                 if can_pan {
                     if response.dragged_by(egui::PointerButton::Primary) {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -108,18 +117,8 @@ impl Viewer {
             .width_range(210.0..=420.0)
             .frame(egui::Frame::side_top_panel(&context.style()).fill(BACKGROUND))
             .show(context, |ui| {
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(12.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), ui.available_height().min(540.0)),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(ui.available_height().min(540.0))
-                                .show(ui, |ui| self.image_details(ui));
-                        },
-                    );
-                });
+                ui.add_space(12.0);
+                egui::ScrollArea::vertical().show(ui, |ui| self.image_details(ui));
             });
     }
 

@@ -7,7 +7,7 @@ use viewer::Viewer;
 
 fn main() -> eframe::Result {
     eframe::run_native(
-        "imgvw - Image Viewer",
+        "viewr - Image Viewer",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1280.0, 820.0])

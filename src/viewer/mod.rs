@@ -42,6 +42,7 @@ pub(crate) struct Viewer {
     frame: u64,
     reveal_selected: bool,
     preferences_open: bool,
+    preferences_was_open: bool,
     settings: Settings,
     settings_path: Option<PathBuf>,
     preferences_draft: Settings,
@@ -75,6 +76,7 @@ impl Viewer {
             frame: 0,
             reveal_selected: false,
             preferences_open: false,
+            preferences_was_open: false,
             settings: Settings::default(),
             settings_path: None,
             preferences_draft: Settings::default(),
@@ -142,6 +144,9 @@ impl Viewer {
     fn select(&mut self, index: usize) {
         if self.selected == Some(index) || index >= self.paths.len() {
             return;
+        }
+        if !self.settings.retain_zoom {
+            self.preview_zoom = 100.0;
         }
         self.selected = Some(index);
         self.preview = None;

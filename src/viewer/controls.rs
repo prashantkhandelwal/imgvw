@@ -86,7 +86,7 @@ impl Viewer {
                                     .suffix("%")
                                     .text("Zoom"),
                             )
-                            .on_hover_text("100% uses the fitted preview size. Scroll to explore enlarged images.");
+                            .on_hover_text("100% uses the fitted preview size. Hover over the image and scroll to zoom; drag to pan.");
                         } else if ui
                             .add(
                                 egui::Slider::new(&mut self.thumbnail_size, 80.0..=240.0)

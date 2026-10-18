@@ -14,6 +14,44 @@ fn navigation_wraps_and_handles_empty_or_single_image() {
     assert_eq!(next_index(Some(0), 1, false), Some(0));
 }
 
+#[test]
+fn selecting_different_images_resets_zoom_unless_retention_is_enabled() {
+    for retain in [false, true] {
+        for grid_view in [false, true] {
+            for zoom in [25.0, 175.0, 400.0] {
+                let context = egui::Context::default();
+                let mut viewer = Viewer::new(context);
+                viewer.settings.retain_zoom = retain;
+                viewer.preferences_draft.retain_zoom = !retain;
+                viewer.grid_view = grid_view;
+                viewer.paths = vec![PathBuf::from("first.png"), PathBuf::from("second.png")];
+                viewer.selected = Some(0);
+                viewer.preview_zoom = zoom;
+                viewer.select(0);
+                assert_eq!(viewer.preview_zoom, zoom, "Reselecting must preserve zoom");
+                viewer.select(2);
+                assert_eq!(
+                    viewer.preview_zoom, zoom,
+                    "Invalid selection must preserve zoom"
+                );
+                viewer.select(1);
+                let expected = if retain { zoom } else { 100.0 };
+                assert_eq!(viewer.selected, Some(1));
+                assert_eq!(viewer.preview_zoom, expected);
+                viewer.preview_zoom = zoom;
+                viewer.navigate(true);
+                assert_eq!(viewer.selected, Some(0));
+                assert_eq!(viewer.preview_zoom, expected);
+                viewer.preview_zoom = zoom;
+                viewer.navigate(false);
+                assert_eq!(viewer.selected, Some(1));
+                assert_eq!(viewer.preview_zoom, expected);
+                assert_eq!(viewer.thumbnail_size, 144.0);
+            }
+        }
+    }
+}
+
 fn render(
     viewer: &mut Viewer,
     context: &egui::Context,
@@ -72,6 +110,83 @@ fn click(viewer: &mut Viewer, context: &egui::Context, position: egui::Pos2) {
                 },
             ],
         );
+    }
+}
+
+#[test]
+fn preview_filmstrip_scrolls_with_the_mouse_wheel_only_when_hovered() {
+    fn first_thumbnail_x(output: &egui::FullOutput) -> f32 {
+        text_position(output, "0.png").x
+    }
+
+    fn wheel(
+        viewer: &mut Viewer,
+        context: &egui::Context,
+        position: egui::Pos2,
+        delta: Vec2,
+    ) -> egui::FullOutput {
+        render(
+            viewer,
+            context,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..30 {
+            render(viewer, context, Vec::new());
+        }
+        render(viewer, context, Vec::new())
+    }
+
+    for count in [1, 24] {
+        let context = egui::Context::default();
+        let mut viewer = Viewer::new(context.clone());
+        viewer.grid_view = false;
+        viewer.selected = Some(0);
+        viewer.paths = (0..count)
+            .map(|index| PathBuf::from(format!("{index}.png")))
+            .collect();
+        viewer.errors = (0..count)
+            .map(|index| (index, "Test thumbnail unavailable".to_string()))
+            .collect();
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        let start = first_thumbnail_x(&output);
+        let hover = text_position(&output, "0.png");
+        let outside = egui::pos2(400.0, 300.0);
+        let output = wheel(&mut viewer, &context, outside, Vec2::new(0.0, -60.0));
+        assert!((first_thumbnail_x(&output) - start).abs() < 1.0);
+
+        for delta in [Vec2::new(0.0, -60.0), Vec2::new(-60.0, 0.0)] {
+            let output = wheel(&mut viewer, &context, hover, delta);
+            let moved = start - first_thumbnail_x(&output);
+            if count == 1 {
+                assert!(moved.abs() < 1.0, "A fitting filmstrip must not scroll");
+            } else {
+                assert!(
+                    (59.0..=61.0).contains(&moved),
+                    "Wheel input should scroll the filmstrip by 60 points, got {moved}"
+                );
+            }
+            let output = wheel(&mut viewer, &context, hover, -delta);
+            assert!(
+                (first_thumbnail_x(&output) - start).abs() < 1.0,
+                "Reverse wheel input should return to the start"
+            );
+            let output = wheel(&mut viewer, &context, hover, -delta);
+            assert!(
+                (first_thumbnail_x(&output) - start).abs() < 1.0,
+                "Scrolling past the start must be clamped"
+            );
+        }
+        assert_eq!(viewer.selected, Some(0));
+        assert_eq!(viewer.preview_zoom, 100.0);
+        assert!(!context.style().always_scroll_the_only_direction);
     }
 }
 
@@ -218,6 +333,125 @@ fn menu_bar_has_larger_text_without_navigation_buttons() {
 }
 
 #[test]
+fn preferences_opens_centered_with_room_for_controls_and_recenters_on_reopen() {
+    let context = egui::Context::default();
+    let mut viewer = Viewer::new(context.clone());
+    viewer.preferences_open = true;
+    for (saved, error) in [
+        (false, None),
+        (true, None),
+        (false, Some("Cannot save settings: permission denied.")),
+    ] {
+        viewer.preferences_saved = saved;
+        viewer.preferences_error = error.map(str::to_string);
+        for _ in 0..3 {
+            render(&mut viewer, &context, Vec::new());
+        }
+        let output = render(&mut viewer, &context, Vec::new());
+        let rect = context.memory(|memory| memory.area_rect(egui::Id::new("Preferences")).unwrap());
+        assert!(
+            rect.center().distance(egui::pos2(640.0, 410.0)) < 1.0,
+            "Preferences should be centered in the main window: {rect:?}"
+        );
+        assert!(rect.width() >= 520.0 && rect.height() >= 200.0);
+        for label in [
+            "Default folder location",
+            "Browse...",
+            "Default view",
+            "Retain zoom percentage between images",
+            "Save",
+            "Ok",
+        ] {
+            let position = text_position(&output, label);
+            assert!(rect.shrink(5.0).contains(position), "{label} must fit");
+        }
+        let browse = text_position(&output, "Browse...");
+        assert!(browse.x > rect.left() + 400.0);
+        assert!(text_position(&output, "Save").y > text_position(&output, "Default view").y);
+        let button_rect = |label| {
+            let position = text_position(&output, label);
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(shape)
+                        if shape.rect.contains(position)
+                            && shape.rect.width() <= 100.0
+                            && shape.rect.height() <= 40.0 =>
+                    {
+                        Some(shape.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Missing button rectangle: {label}"))
+        };
+        let save = button_rect("Save");
+        let ok = button_rect("Ok");
+        let browse = button_rect("Browse...");
+        assert_eq!(save.size(), Vec2::new(80.0, 28.0));
+        assert_eq!(ok.size(), save.size());
+        assert!((save.top() - ok.top()).abs() < 1.0);
+        assert!((ok.right() - browse.right()).abs() < 1.0);
+        assert!((ok.left() - save.right() - context.style().spacing.item_spacing.x).abs() < 1.0);
+        assert!(
+            (5.0..=12.0).contains(&(rect.bottom() - ok.bottom())),
+            "Buttons should sit at the bottom of the window: {rect:?}, {ok:?}"
+        );
+        for _ in 0..10 {
+            render(&mut viewer, &context, Vec::new());
+        }
+        let settled =
+            context.memory(|memory| memory.area_rect(egui::Id::new("Preferences")).unwrap());
+        assert!(
+            (settled.height() - rect.height()).abs() < 1.0,
+            "The footer must not grow the window on each frame: {rect:?}, {settled:?}"
+        );
+    }
+    viewer.preferences_error = None;
+    let output = render(&mut viewer, &context, Vec::new());
+    let title = text_position(&output, "Preferences");
+    let moved = title + Vec2::new(100.0, 60.0);
+    render(
+        &mut viewer,
+        &context,
+        vec![
+            egui::Event::PointerMoved(title),
+            egui::Event::PointerButton {
+                pos: title,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    render(
+        &mut viewer,
+        &context,
+        vec![egui::Event::PointerMoved(moved)],
+    );
+    render(
+        &mut viewer,
+        &context,
+        vec![egui::Event::PointerButton {
+            pos: moved,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    let rect = context.memory(|memory| memory.area_rect(egui::Id::new("Preferences")).unwrap());
+    assert!(rect.center().distance(egui::pos2(640.0, 410.0)) > 50.0);
+    viewer.preferences_open = false;
+    render(&mut viewer, &context, Vec::new());
+    viewer.preferences_open = true;
+    for _ in 0..3 {
+        render(&mut viewer, &context, Vec::new());
+    }
+    let rect = context.memory(|memory| memory.area_rect(egui::Id::new("Preferences")).unwrap());
+    assert!(rect.center().distance(egui::pos2(640.0, 410.0)) < 1.0);
+}
+
+#[test]
 fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
     let directory = tempfile::tempdir().unwrap();
     let photos = directory.path().join("photos");
@@ -233,6 +467,7 @@ fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
     viewer.preferences_draft = Settings {
         default_folder: photos.to_str().unwrap().into(),
         default_view: DefaultView::Preview,
+        retain_zoom: false,
     };
     render(&mut viewer, &context, Vec::new());
     let output = render(&mut viewer, &context, Vec::new());
@@ -240,6 +475,16 @@ fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
     let ok = text_position(&output, "Ok");
     let folder_label = text_position(&output, "Default folder location");
     let view_label = text_position(&output, "Default view");
+    click(
+        &mut viewer,
+        &context,
+        text_position(&output, "Retain zoom percentage between images"),
+    );
+    assert!(viewer.preferences_draft.retain_zoom);
+    assert!(
+        !viewer.settings.retain_zoom,
+        "Checkbox edits apply only after saving"
+    );
     assert!(save.x < ok.x && save.x > folder_label.x);
     assert!(save.y > view_label.y);
     click(&mut viewer, &context, save);
@@ -250,11 +495,19 @@ fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
 
     let mut restarted = Viewer::new(context.clone());
     restarted.load_settings(&path, &context);
+    assert!(restarted.settings.retain_zoom);
     assert_eq!(restarted.folder.as_deref(), Some(photos.as_path()));
     assert!(!restarted.grid_view);
     wait_until(&mut restarted, &context, |viewer| viewer.preview.is_some());
 
     viewer.preferences_draft.default_view = DefaultView::Grid;
+    let output = render(&mut viewer, &context, Vec::new());
+    click(
+        &mut viewer,
+        &context,
+        text_position(&output, "Retain zoom percentage between images"),
+    );
+    assert!(!viewer.preferences_draft.retain_zoom);
     render(&mut viewer, &context, Vec::new());
     let output = render(&mut viewer, &context, Vec::new());
     click(&mut viewer, &context, text_position(&output, "Ok"));
@@ -269,6 +522,52 @@ fn preferences_save_and_ok_persist_edits_and_restore_startup_defaults() {
     assert!(viewer.grid_view);
     restarted.load_settings(&path, &context);
     assert!(restarted.grid_view);
+    assert!(!restarted.settings.retain_zoom);
+}
+
+#[test]
+fn saving_zoom_preferences_preserves_the_current_view() {
+    let directory = tempfile::tempdir().unwrap();
+    for default_view in [DefaultView::Grid, DefaultView::Preview] {
+        for grid_view in [false, true] {
+            for button in ["Save", "Ok"] {
+                let context = egui::Context::default();
+                let mut viewer = Viewer::new(context.clone());
+                let path = directory.path().join("settings.json");
+                viewer.settings_path = Some(path.clone());
+                viewer.settings.default_view = default_view;
+                viewer.preferences_draft = viewer.settings.clone();
+                viewer.grid_view = grid_view;
+                viewer.preview_zoom = 175.0;
+                viewer.preferences_open = true;
+                render(&mut viewer, &context, Vec::new());
+                let output = render(&mut viewer, &context, Vec::new());
+                click(
+                    &mut viewer,
+                    &context,
+                    text_position(&output, "Retain zoom percentage between images"),
+                );
+                assert!(viewer.preferences_draft.retain_zoom);
+                let output = render(&mut viewer, &context, Vec::new());
+                click(&mut viewer, &context, text_position(&output, button));
+                assert!(viewer.preferences_saved);
+                assert_eq!(
+                    viewer.grid_view, grid_view,
+                    "{button} must preserve the pane"
+                );
+                assert_eq!(viewer.preview_zoom, 175.0);
+                assert!(!viewer.reveal_selected);
+                assert_eq!(viewer.preferences_open, button == "Save");
+                assert!(settings::load(&path).unwrap().retain_zoom);
+                assert!(
+                    viewer.save_preferences(),
+                    "Saving unchanged settings should work"
+                );
+                assert_eq!(viewer.grid_view, grid_view);
+                assert!(!viewer.reveal_selected);
+            }
+        }
+    }
 }
 
 #[test]
@@ -566,6 +865,94 @@ fn grid_uses_the_shared_background_everywhere() {
 }
 
 #[test]
+fn preview_mouse_wheel_zooms_hovered_or_clicked_images_within_slider_limits() {
+    fn image_rect(output: &egui::FullOutput, texture: egui::TextureId) -> (egui::Rect, egui::Rect) {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                    Some((mesh.calc_bounds(), shape.clip_rect))
+                }
+                _ => None,
+            })
+            .expect("Preview image should be rendered")
+    }
+
+    fn wheel(viewer: &mut Viewer, context: &egui::Context, position: egui::Pos2, delta: f32) {
+        render(
+            viewer,
+            context,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, delta),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..40 {
+            render(viewer, context, Vec::new());
+        }
+    }
+
+    let context = egui::Context::default();
+    let mut viewer = Viewer::new(context.clone());
+    viewer.grid_view = false;
+    viewer.paths = vec![PathBuf::from("photo.png")];
+    viewer.selected = Some(0);
+    viewer.errors.insert(0, "Test thumbnail unavailable".into());
+    let texture = context.load_texture(
+        "wheel_zoom_preview",
+        egui::ColorImage::new([640, 480], Color32::WHITE),
+        Default::default(),
+    );
+    viewer.preview = Some(texture.clone());
+    render(&mut viewer, &context, Vec::new());
+    let output = render(&mut viewer, &context, Vec::new());
+    let fitted = image_rect(&output, texture.id()).0;
+    for clicked in [false, true] {
+        viewer.preview_zoom = 100.0;
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        let (image, clip) = image_rect(&output, texture.id());
+        let position = image.intersect(clip).center();
+        if clicked {
+            click(&mut viewer, &context, position);
+        }
+        wheel(&mut viewer, &context, position, 60.0);
+        assert!(
+            (110.0..115.0).contains(&viewer.preview_zoom),
+            "Wheel up should zoom in, got {}",
+            viewer.preview_zoom
+        );
+        let output = render(&mut viewer, &context, Vec::new());
+        let enlarged = image_rect(&output, texture.id()).0;
+        assert!((enlarged.width() / fitted.width() - viewer.preview_zoom / 100.0).abs() < 0.01);
+        wheel(&mut viewer, &context, position, -60.0);
+        assert!((viewer.preview_zoom - 100.0).abs() < 0.1);
+    }
+    for (start, delta, expected) in [(399.0, 120.0, 400.0), (26.0, -120.0, 25.0)] {
+        viewer.preview_zoom = start;
+        render(&mut viewer, &context, Vec::new());
+        let output = render(&mut viewer, &context, Vec::new());
+        let (image, clip) = image_rect(&output, texture.id());
+        wheel(&mut viewer, &context, image.intersect(clip).center(), delta);
+        assert_eq!(viewer.preview_zoom, expected);
+    }
+    for position in [egui::pos2(25.0, 120.0), egui::pos2(50.0, 720.0)] {
+        wheel(&mut viewer, &context, position, 120.0);
+        assert_eq!(
+            viewer.preview_zoom, 25.0,
+            "Wheel input outside the preview image must not zoom"
+        );
+    }
+    assert_eq!(viewer.thumbnail_size, 144.0);
+    assert_eq!(viewer.selected, Some(0));
+}
+
+#[test]
 fn preview_zoom_slider_resizes_and_pans_without_changing_thumbnails() {
     fn preview_rect(
         output: &egui::FullOutput,
@@ -627,18 +1014,10 @@ fn preview_zoom_slider_resizes_and_pans_without_changing_thumbnails() {
             render(
                 &mut viewer,
                 &context,
-                vec![
-                    egui::Event::PointerMoved(clip.center()),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: Vec2::new(0.0, -120.0),
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
+                vec![egui::Event::PointerMoved(clip.center())],
             );
             let output = render(&mut viewer, &context, Vec::new());
             let before_drag = preview_rect(&output, texture).0;
-            assert!(before_drag.min.y < image.min.y);
             assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Grab);
             let start = clip.center();
             render(
@@ -964,6 +1343,34 @@ fn opening_a_folder_loads_nested_images_and_counts_them_in_both_views() {
     viewer.select(2);
     wait_until(&mut viewer, &context, |viewer| viewer.preview.is_some());
     assert_eq!(viewer.metadata.as_ref().unwrap().width, 80);
+}
+
+#[test]
+fn image_details_heading_stays_at_the_top_of_the_side_panel() {
+    for height in [400.0, 820.0, 1200.0] {
+        for selected in [None, Some(0)] {
+            let context = egui::Context::default();
+            let mut viewer = Viewer::new(context.clone());
+            viewer.paths = vec![PathBuf::from("photo.png")];
+            viewer.selected = selected;
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1280.0, height),
+                    )),
+                    ..Default::default()
+                },
+                |context| viewer.properties(context),
+            );
+            let heading = text_position(&output, "IMAGE DETAILS");
+            assert!(heading.x > 1000.0);
+            assert!(
+                heading.y < 35.0,
+                "Heading must stay at the panel top at height {height}: {heading:?}"
+            );
+        }
+    }
 }
 
 #[test]
